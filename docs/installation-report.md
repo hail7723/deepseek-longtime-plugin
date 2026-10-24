@@ -5,8 +5,8 @@ Date: 2026-10-24
 ## Delivered
 
 - Source: `D:\practice\deepseek-memory-plugin`
-- Package: `dsh-project-memory@0.1.0`
-- Packed artifact: `D:\practice\deepseek-memory-plugin\dist\dsh-project-memory-0.1.0.tgz`
+- Package: `@hail7723/dsh-project-memory@0.1.1`
+- Packed artifact: `D:\practice\deepseek-memory-plugin\dist\hail7723-dsh-project-memory-0.1.1.tgz`
 - Isolated profile: `D:\practice\Deepseekharness\memory\dev-profile-home\profiles\memory-plugin-dev`
 
 No file under the global Harness installation directory was changed.
@@ -28,7 +28,7 @@ The installed bundle is already selected and its `project-memory` row is enabled
 
 ```powershell
 $env:DSH_HOME = 'D:\practice\Deepseekharness\memory\dev-profile-home'
-& $dsh021 plugin --profile memory-plugin-dev remove dsh-project-memory
+& $dsh021 plugin --profile memory-plugin-dev remove @hail7723/dsh-project-memory
 ```
 
 If the manager reports `restart-required`, restart that profile. Removing the plugin does not delete project databases; archive or delete `.deepseek-memory` separately only when the history is intentionally discarded.

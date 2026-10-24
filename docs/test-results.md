@@ -44,6 +44,6 @@ Windows note: the default Node test runner isolates files by spawning child proc
 - CLI runner: `@deepseek-ai/dsh 0.2.1-rc.3` installed under the workspace with all dependency install scripts disabled.
 - Profile: `memory-plugin-dev`, created from the shipped `headless` profile under a separate `DSH_HOME`.
 - Direct directory install: failed as expected on this Windows account because pnpm could not create a symbolic link; it left no dependency or plugin row behind.
-- Packed install: `dsh-project-memory-0.1.0.tgz` installed successfully.
-- Composition: `--dump-config` shows bundle `dsh-project-memory` and enabled row `project-memory`.
+- Packed install: `hail7723-dsh-project-memory-0.1.1.tgz` installed successfully.
+- Composition: `--dump-config` shows bundle `@hail7723/dsh-project-memory` and enabled row `project-memory`.
 - Host boot probe: `--profile memory-plugin-dev --help` loaded the profile and exited normally without a model request.

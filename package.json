@@ -1,6 +1,6 @@
 {
-  "name": "dsh-project-memory",
-  "version": "0.1.0",
+  "name": "@hail7723/dsh-project-memory",
+  "version": "0.1.1",
   "description": "Local SQLite project memory with durable recovery and revision conflict checks for DeepSeek Harness.",
   "type": "module",
   "license": "MIT",

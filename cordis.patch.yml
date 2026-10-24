@@ -1,4 +1,4 @@
 - insert:
     - id: project-memory
-      name: 'dsh-project-memory'
+      name: '@hail7723/dsh-project-memory'
       config: {}

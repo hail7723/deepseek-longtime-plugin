@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-10-24
+
+### Fixed
+
+- Renamed the package to `@hail7723/dsh-project-memory` to avoid collision with an unrelated npm package named `dsh-project-memory@0.1.0` that targets DSH `0.1.0-rc.6`.
+- Declared and reverified compatibility with DSH `0.2.1-rc.3` under the unique package identity.
+
 ## [0.1.0] - 2026-10-24
 
 ### Added
