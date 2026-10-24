@@ -252,6 +252,22 @@ test('evidence is isolated by branch and workspace and searchable in scope', (t)
   );
 });
 
+test('history search includes checkpoint summaries and preserves scope and limits', (t) => {
+  const { store, projectId } = temporaryProject(t);
+  store.createTask({ projectId, id: 'task-history' });
+  store.createTask({ projectId, id: 'other-task' });
+  store.addEvidence({ projectId, taskId: 'task-history', id: 'evidence-history', kind: 'test', payload: { summary: 'shared history text' }, branch: 'main', workspace: 'a' });
+  store.createCheckpoint({ projectId, taskId: 'task-history', id: 'checkpoint-history', payload: { summary: 'shared history text' }, branch: 'main', workspace: 'a' });
+  store.createCheckpoint({ projectId, taskId: 'task-history', id: 'wrong-branch', payload: { summary: 'shared history text' }, branch: 'feature', workspace: 'a' });
+  store.createCheckpoint({ projectId, taskId: 'task-history', id: 'wrong-workspace', payload: { summary: 'shared history text' }, branch: 'main', workspace: 'b' });
+  store.createCheckpoint({ projectId, taskId: 'other-task', id: 'wrong-task', payload: { summary: 'shared history text' }, branch: 'main', workspace: 'a' });
+  const scope = { projectId, taskId: 'task-history', query: 'shared history', branch: 'main', workspace: 'a' };
+  assert.deepEqual(store.search(scope).map(row => row.id), ['checkpoint-history', 'evidence-history']);
+  assert.equal(store.search(scope)[0].kind, 'checkpoint');
+  assert.equal(store.search(scope)[0].summary, 'shared history text');
+  assert.deepEqual(store.search({ ...scope, limit: 1 }).map(row => row.id), ['checkpoint-history']);
+});
+
 test('commitCheckpoint atomically validates both revisions and fences the snapshot', (t) => {
   const { store, projectId } = temporaryProject(t);
   store.createTask({

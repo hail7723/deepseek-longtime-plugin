@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "项目记忆",
-    "description": "使用本机 SQLite 保存项目任务、契约、证据与恢复检查点。"
+    "description": "在 Harness 中可视化管理本机 SQLite 项目任务、契约、证据与恢复检查点。"
   }
 }

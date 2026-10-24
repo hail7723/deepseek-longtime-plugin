@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Project Memory",
-    "description": "Keeps project tasks, contracts, evidence, and recovery checkpoints in a local SQLite database."
+    "description": "Visually manages project tasks, contracts, evidence, and recovery checkpoints in local SQLite."
   }
 }

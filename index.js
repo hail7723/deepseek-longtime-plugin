@@ -1,1 +1,1 @@
-export { apply, inject } from './src/plugin.js';
+export { default } from './src/service.js';

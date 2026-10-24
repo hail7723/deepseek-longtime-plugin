@@ -2,6 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { openProjectStore } from './store.js';
+import {
+  bootstrap as bootstrapOperation,
+  checkpoint as checkpointOperation,
+  claim as claimOperation,
+  proposeContractChange as proposeContractChangeOperation,
+  readProjectSnapshot,
+  search as searchOperation,
+} from './operations.js';
 
 const MARKER_DIR = '.deepseek-memory';
 const MARKER_FILE = 'project.json';
@@ -129,6 +137,23 @@ class AgentMemoryBinding {
   }
 
   bootstrap(args) {
+    const sharedResult = bootstrapOperation({
+      cwd: this.cwd,
+      taskId: args.task_id,
+      objective: args.objective,
+      acceptanceCriteria: args.acceptance_criteria ?? [],
+      constraints: args.constraints ?? [],
+      nextAction: args.next_action ?? null,
+      sourceRef: args.source_ref ?? `session:${this.agent.id}`,
+      idempotencyKey: args.idempotency_key,
+    });
+    if (sharedResult.ok) {
+      this.refresh(false);
+      this.taskId = sharedResult.task.id;
+    }
+    return sharedResult;
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.refresh(true);
     const taskId = validateString(args.task_id, 'task_id');
     const facts = this.facts();
@@ -157,6 +182,18 @@ class AgentMemoryBinding {
   }
 
   read(args) {
+    const sharedResult = readProjectSnapshot({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      sinceEventSeq: args.since_event_seq ?? 0,
+    });
+    if (sharedResult.ok && sharedResult.initialized && sharedResult.task !== null) {
+      this.refresh(false);
+      this.taskId = sharedResult.task.id;
+    }
+    return sharedResult;
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.requireBound();
     const taskId = args.task_id ?? this.taskId;
     validateString(taskId, 'task_id');
@@ -180,6 +217,20 @@ class AgentMemoryBinding {
   }
 
   claim(args) {
+    const sharedResult = claimOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      expectedRevision: args.expected_revision,
+      owner: String(this.agent.id),
+      leaseSeconds: args.lease_seconds ?? 300,
+    });
+    if (sharedResult.ok) {
+      this.taskId = sharedResult.taskId;
+      this.lease = sharedResult.leaseToken;
+    }
+    return sharedResult;
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.requireBound();
     const taskId = args.task_id ?? this.taskId;
     validateString(taskId, 'task_id');
@@ -207,6 +258,24 @@ class AgentMemoryBinding {
   }
 
   checkpoint(args) {
+    const sharedResult = checkpointOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      expectedRevision: args.expected_revision,
+      expectedContractRevision: args.expected_contract_revision,
+      owner: String(this.agent.id),
+      leaseToken: args.lease_token,
+      patch: args.patch ?? {},
+      evidence: args.evidence ?? [],
+      summary: args.summary ?? '',
+      nextAction: args.next_action ?? null,
+      pendingOperations: args.pending_operations ?? [],
+      idempotencyKey: args.idempotency_key,
+    });
+    if (sharedResult.ok) this.taskId = sharedResult.taskId;
+    return sharedResult;
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.requireBound();
     const taskId = args.task_id ?? this.taskId;
     validateString(taskId, 'task_id');
@@ -243,6 +312,14 @@ class AgentMemoryBinding {
   }
 
   search(args) {
+    return searchOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      query: args.query ?? '',
+      limit: args.limit ?? 20,
+    });
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.requireBound();
     const facts = this.facts();
     return {
@@ -259,6 +336,17 @@ class AgentMemoryBinding {
   }
 
   proposeContractChange(args) {
+    return proposeContractChangeOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      expectedContractRevision: args.expected_contract_revision,
+      diff: args.diff,
+      sourceRef: args.source_ref,
+      idempotencyKey: args.idempotency_key,
+      owner: String(this.agent.id),
+    });
+
+    /* Legacy inline implementation retained below for source compatibility; unreachable. */
     this.requireBound();
     const taskId = args.task_id ?? this.taskId;
     validateString(taskId, 'task_id');

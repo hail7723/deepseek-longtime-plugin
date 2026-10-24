@@ -825,10 +825,21 @@ class ProjectMemoryStore {
       parameters.push(workspace);
     }
     parameters.push(limit);
-    return this.db.prepare(`
-      SELECT * FROM evidence WHERE ${clauses.join(' AND ')}
+    const where = clauses.join(' AND ');
+    const evidence = this.db.prepare(`
+      SELECT * FROM evidence WHERE ${where}
       ORDER BY event_seq DESC, id LIMIT ?
     `).all(...parameters).map(mapEvidence);
+    const checkpoints = this.db.prepare(`
+      SELECT * FROM checkpoints WHERE ${where}
+      ORDER BY event_seq DESC, id LIMIT ?
+    `).all(...parameters).map(row => {
+      const checkpoint = mapCheckpoint(row);
+      return { ...checkpoint, kind: 'checkpoint', summary: checkpoint.payload?.summary ?? '' };
+    });
+    return [...evidence, ...checkpoints]
+      .sort((left, right) => right.eventSeq - left.eventSeq || left.id.localeCompare(right.id))
+      .slice(0, limit);
   }
 
   proposeContractChange({

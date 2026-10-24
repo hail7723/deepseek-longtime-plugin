@@ -1,7 +1,7 @@
 {
   "name": "dsh-longtime-memory",
-  "version": "0.1.2",
-  "description": "Local SQLite project memory with durable recovery and revision conflict checks for DeepSeek Harness.",
+  "version": "0.2.2",
+  "description": "Local SQLite project memory for DeepSeek Harness with a native panel, durable recovery, and revision conflict checks.",
   "type": "module",
   "license": "MIT",
   "author": "hail7723",
@@ -25,11 +25,13 @@
   ],
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "client.js",
     "src/*.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -39,13 +41,21 @@
     "CHANGELOG.md",
     "docs/*.md"
   ],
+  "dependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-api-gateway": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.3"
+  },
   "engines": {
     "node": ">=24.0.0",
     "dsh": ">=0.2.1-rc.3 <0.3.0"
   },
   "scripts": {
-    "check": "node --check index.js && node --check src/plugin.js && node --check src/store.js",
-    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js",
+    "check": "node --check index.js && node --check client.js && node --check src/plugin.js && node --check src/operations.js && node --check src/service.js && node --check src/store.js",
+    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js test/operations.test.js test/service.test.js test/client.test.js test/gateway-runtime.test.js",
     "pack:check": "npm pack --dry-run"
   },
   "publishConfig": {
@@ -54,6 +64,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
     }
   }
 }
