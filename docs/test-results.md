@@ -2,13 +2,15 @@
 
 Run on 2026-10-24 with Node `v24.19.0` and SQLite `3.53.3`.
 
+Package identity: `dsh-longtime-memory@0.1.2`.
+
 Command:
 
 ```powershell
 node --test --test-isolation=none test/store.test.js test/plugin.test.js
 ```
 
-Result: **15 passed, 0 failed** in 519 ms.
+Result: **15 passed, 0 failed** in 485 ms.
 
 ## Covered
 
@@ -42,8 +44,7 @@ Windows note: the default Node test runner isolates files by spawning child proc
 ## Isolated profile verification
 
 - CLI runner: `@deepseek-ai/dsh 0.2.1-rc.3` installed under the workspace with all dependency install scripts disabled.
-- Profile: `memory-plugin-dev`, created from the shipped `headless` profile under a separate `DSH_HOME`.
-- Direct directory install: failed as expected on this Windows account because pnpm could not create a symbolic link; it left no dependency or plugin row behind.
-- Packed install: `hail7723-dsh-project-memory-0.1.1.tgz` installed successfully.
-- Composition: `--dump-config` shows bundle `@hail7723/dsh-project-memory` and enabled row `project-memory`.
-- Host boot probe: `--profile memory-plugin-dev --help` loaded the profile and exited normally without a model request.
+- Packed artifact: `dsh-longtime-memory-0.1.2.tgz` (SHA-256 recorded in the GitHub release notes).
+- Headless profile `memory-plugin-dev`: installed from the `.tgz`; `--dump-config` composes bundle `dsh-longtime-memory` and enabled row `project-memory`.
+- Web profile `memory-ui-dev`: installed from the same `.tgz`, booted with `--no-open --host 127.0.0.1 --port 0`; the Host printed its URL and stayed running with no startup error.
+- Package rename check: the release asset's embedded `package.json` reports `dsh-longtime-memory@0.1.2` and the patch row uses the same name. The previously renamed `v0.1.1` asset still contained the old `@hail7723/dsh-project-memory` identity, which is why `0.1.2` replaces it.

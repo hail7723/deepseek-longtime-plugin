@@ -1,17 +1,17 @@
 {
-  "name": "@hail7723/dsh-project-memory",
-  "version": "0.1.1",
+  "name": "dsh-longtime-memory",
+  "version": "0.1.2",
   "description": "Local SQLite project memory with durable recovery and revision conflict checks for DeepSeek Harness.",
   "type": "module",
   "license": "MIT",
   "author": "hail7723",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hail7723/deepseek-memory-plugin.git"
+    "url": "git+https://github.com/hail7723/deepseek-longtime-plugin.git"
   },
-  "homepage": "https://github.com/hail7723/deepseek-memory-plugin#readme",
+  "homepage": "https://github.com/hail7723/deepseek-longtime-plugin#readme",
   "bugs": {
-    "url": "https://github.com/hail7723/deepseek-memory-plugin/issues"
+    "url": "https://github.com/hail7723/deepseek-longtime-plugin/issues"
   },
   "keywords": [
     "deepseek",
@@ -19,7 +19,9 @@
     "dsh",
     "plugin",
     "sqlite",
-    "agent-memory"
+    "agent-memory",
+    "longtime-memory",
+    "project-memory"
   ],
   "exports": {
     ".": "./index.js",
