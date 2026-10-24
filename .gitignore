@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+Thumbs.db
+
+# Project memory runtime databases
+.deepseek-memory/memory.sqlite
+.deepseek-memory/memory.sqlite-wal
+.deepseek-memory/memory.sqlite-shm

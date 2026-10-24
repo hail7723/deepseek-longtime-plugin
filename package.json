@@ -1,0 +1,57 @@
+{
+  "name": "dsh-project-memory",
+  "version": "0.1.0",
+  "description": "Local SQLite project memory with durable recovery and revision conflict checks for DeepSeek Harness.",
+  "type": "module",
+  "license": "MIT",
+  "author": "hail7723",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hail7723/deepseek-memory-plugin.git"
+  },
+  "homepage": "https://github.com/hail7723/deepseek-memory-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/hail7723/deepseek-memory-plugin/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "sqlite",
+    "agent-memory"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "src/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "docs/*.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0",
+    "dsh": ">=0.2.1-rc.3 <0.3.0"
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check src/plugin.js && node --check src/store.js",
+    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js",
+    "pack:check": "npm pack --dry-run"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
