@@ -25,6 +25,12 @@ All notable changes to this project will be documented in this file.
 
 - Do not read the non-injected Harness `ctx.config` property during `agent/created`; this previously prevented real session creation with `cannot get property "config" without inject`.
 
+## [0.3.0-dev.6] - 2026-10-25
+
+### Added
+
+- "等待约 N 秒后自动重试" option in the save-state bar while another session holds the lease: a real timer retries the save once when the lease is due to expire, shows a countdown label, and can be cancelled ("取消等待"); an immediate manual retry cancels any scheduled wait first. Completes the R01 UI requirement (refresh / wait-then-retry / draft), with a timer-driven client test covering both the firing and the cancelled path.
+
 ## [0.3.0-dev.5] - 2026-10-25
 
 ### Changed

@@ -55,6 +55,8 @@ window.__ModuleLoader__.load({
       savedAt: iso => `已保存于 ${formatRelative(iso)}`, saving: '正在保存',
       waitingLease: seconds => `等待另一会话保存（约 ${Math.max(1, Math.round(seconds))} 秒后可重试）`,
       unsaved: '未保存 — 可重试', retrySave: '重试保存', keepDraft: '保留为待同步草稿',
+      waitRetry: seconds => `等待约 ${Math.max(1, Math.round(seconds))} 秒后自动重试`,
+      cancelWait: '取消等待', willRetryIn: seconds => `将在约 ${Math.max(1, Math.round(seconds))} 秒后自动重试保存`,
       discardDraft: '取消草稿', diagnostics: '诊断详情', draftKept: '草稿已保留在本面板，稍后可重试保存',
     };
 
@@ -142,14 +144,21 @@ window.__ModuleLoader__.load({
         value.type === 'conflict' ? h('div', { className: 'pm-conflict' }, button('重新加载最新状态', onReload, false, false), h('pre', { className: 'pm-pre' }, json(value.detail))) : null);
     }
 
-    function SaveStatus({ lease, deferred, checkpointAt, busy, draftKept, onRetry, onDiscard, onReload }) {
+    function SaveStatus({ lease, deferred, checkpointAt, busy, draftKept, pendingWait, onWait, onCancelWait, onRetry, onDiscard, onReload }) {
       const [showDiagnostics, setShowDiagnostics] = useState(false);
       let tone = 'saved'; let label = checkpointAt ? TEXT.savedAt(checkpointAt) : '尚未保存过';
       if (busy) { tone = 'saving'; label = TEXT.saving; }
+      else if (pendingWait) { tone = 'waiting'; label = pendingWait.label; }
       else if (lease && lease.heldBy === 'other-session') { tone = 'waiting'; label = TEXT.waitingLease(lease.retryAfterSeconds ?? lease.remainingSeconds ?? 60); }
       else if ((deferred && deferred.queued > 0) || draftKept) { tone = 'unsaved'; label = TEXT.unsaved; }
       const actions = [];
-      if (tone === 'waiting' || tone === 'unsaved') actions.push(button(TEXT.retrySave, onRetry, false, Boolean(busy)));
+      if (pendingWait) actions.push(button(TEXT.cancelWait, onCancelWait, false, Boolean(busy)));
+      else if (tone === 'waiting') {
+        const waitSeconds = lease.retryAfterSeconds ?? lease.remainingSeconds ?? 60;
+        actions.push(button(TEXT.waitRetry(waitSeconds), () => onWait(waitSeconds), false, Boolean(busy)));
+        actions.push(button(TEXT.retrySave, onRetry, false, Boolean(busy)));
+      }
+      if (tone === 'unsaved') actions.push(button(TEXT.retrySave, onRetry, false, Boolean(busy)));
       if (deferred && deferred.queued > 0) actions.push(button(TEXT.discardDraft, onDiscard, false, Boolean(busy)));
       const diagnostics = lease && lease.diagnostics;
       return h('div', { className: `pm-save pm-save-${tone}`, role: 'status' },
@@ -176,6 +185,16 @@ window.__ModuleLoader__.load({
       const [proposal, setProposal] = useState({ sourceRef: '', diff: '' });
       const [lastCommitArgs, setLastCommitArgs] = useState(null);
       const [draftKept, setDraftKept] = useState(false);
+      // When the Host cannot map exactly one workspace, the panel asks the
+      // user to pick from its candidate list instead of guessing.
+      // When the user chooses to wait out another session's lease, a real
+      // timer retries the save once and can be cancelled before it fires.
+      const [pendingWait, setPendingWait] = useState(null);
+      function startWaitRetry(seconds) {
+        const waitSeconds = Math.max(1, Math.round(Number(seconds) || 1));
+        const timer = setTimeout(() => { setPendingWait(null); retrySave(); }, waitSeconds * 1000);
+        setPendingWait({ label: TEXT.willRetryIn(waitSeconds), cancel: () => { clearTimeout(timer); setPendingWait(null); } });
+      }
       // When the Host cannot map exactly one workspace, the panel asks the
       // user to pick from its candidate list instead of guessing.
       const [workspaceChoices, setWorkspaceChoices] = useState(null);
@@ -289,6 +308,8 @@ window.__ModuleLoader__.load({
         else setDraftKept(true);
       }
       async function retrySave() {
+        // An immediate retry supersedes any scheduled wait.
+        if (pendingWait) pendingWait.cancel();
         if (lastCommitArgs) {
           setDraftKept(false);
           const result = await invoke('commit', lastCommitArgs, '进度已保存', true);
@@ -318,7 +339,8 @@ window.__ModuleLoader__.load({
       const leaseStatus = data && data.leaseStatus;
       const saveBar = h(SaveStatus, {
         lease: leaseStatus, deferred: deferredCounts, checkpointAt: data && data.checkpoint && data.checkpoint.createdAt,
-        busy: Boolean(busy && busy !== 'snapshot' && busy !== 'search'), draftKept,
+        busy: Boolean(busy && busy !== 'snapshot' && busy !== 'search'), draftKept, pendingWait,
+        onWait: startWaitRetry, onCancelWait: () => { if (pendingWait) pendingWait.cancel(); },
         onRetry: retrySave, onDiscard: () => { const queued = deferredItems.find(item => item.status === 'queued'); if (queued) discardDraft(queued.id); }, onReload: () => load(false),
       });
       const tabs = [['overview', TEXT.overview], ['tasks', TEXT.tasks], ['contracts', TEXT.contracts], ['history', TEXT.history]];
