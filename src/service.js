@@ -112,7 +112,9 @@ class ProjectMemoryRemoteService extends TypertRemoteService {
       ok: false,
       error: {
         code: candidates.length === 0 ? 'WORKSPACE_UNAVAILABLE' : 'WORKSPACE_SELECTION_REQUIRED',
-        message: candidates.length === 0 ? 'Open Project Memory from an active conversation.' : 'More than one active workspace exists; open the panel from the intended conversation.',
+        message: candidates.length === 0
+          ? 'No active conversation has a working directory yet; start or select a project conversation, then refresh.'
+          : 'More than one active workspace exists; the panel shows an explicit picker.',
       },
       candidates,
     };

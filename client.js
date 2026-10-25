@@ -73,9 +73,10 @@ window.__ModuleLoader__.load({
     // and fences are only shown inside the diagnostics area.
     const CODE_TEXT = {
       LEASE_CONFLICT: e => `另一会话正在保存，约 ${Math.max(1, Math.round(Number(e.retryAfterSeconds ?? 60)))} 秒后可重试`,
-      SESSION_REQUIRED: () => '无法确定当前会话，请从项目会话窗口打开本面板后重试',
-      WORKSPACE_UNAVAILABLE: () => '当前会话没有可用工作区，请在项目会话中打开本面板',
-      WORKSPACE_SELECTION_REQUIRED: () => '存在多个活动工作区，请从对应的会话窗口打开本面板',
+      SESSION_REQUIRED: () => '本面板需要知道当前会话；请在项目会话激活的窗口中使用，然后点“刷新”',
+      WORKSPACE_UNAVAILABLE: () => '当前没有带工作区的项目会话；请在本窗口打开或新建一个项目会话，然后点“刷新”',
+      WORKSPACE_SELECTION_REQUIRED: () => '存在多个活动工作区；请在面板顶部的候选框中选择一个',
+      WORKSPACE_PICK_REQUIRED: () => '请选择一个项目工作区',
       TASK_SELECTION_REQUIRED: () => '有多个未完成任务，请先明确选择一个任务',
       NOT_FOUND: () => '未找到对应记录，请刷新后重试',
       PROJECT_MEMORY_NOT_INITIALIZED: () => '当前工作区尚未初始化项目记忆',
@@ -175,6 +176,9 @@ window.__ModuleLoader__.load({
       const [proposal, setProposal] = useState({ sourceRef: '', diff: '' });
       const [lastCommitArgs, setLastCommitArgs] = useState(null);
       const [draftKept, setDraftKept] = useState(false);
+      // When the Host cannot map exactly one workspace, the panel asks the
+      // user to pick from its candidate list instead of guessing.
+      const [workspaceChoices, setWorkspaceChoices] = useState(null);
 
       const task = data && (data.task || data.currentTask) || {};
       const contract = data && (data.contract || data.confirmedContract) || {};
@@ -196,13 +200,37 @@ window.__ModuleLoader__.load({
         finally { setBusy(''); }
       }
       async function resolveWorkspace() {
-        const workspace = await api('workspace', {});
-        if (!workspace || workspace.ok === false || !workspace.cwd) throw (workspace && workspace.error) || new Error('当前会话没有可用工作区');
-        setCwd(workspace.cwd);
-        // The session-scoped slot prop wins; the Host's sole-candidate answer
-        // is the single-window fallback only.
-        if (!sessionId && workspace.sessionId) setSessionId(workspace.sessionId);
-        return workspace.cwd;
+        // The session-scoped slot prop wins; without it the Host's
+        // sole-candidate answer is the single-window fallback.
+        let workspace = sessionId ? await api('workspace', { session_id: sessionId }) : await api('workspace', {});
+        if ((!workspace || workspace.ok === false || !workspace.cwd) && sessionId) workspace = await api('workspace', {});
+        if (workspace && workspace.ok !== false && workspace.cwd) {
+          setCwd(workspace.cwd);
+          setWorkspaceChoices(null);
+          if (!sessionId && workspace.sessionId) setSessionId(workspace.sessionId);
+          return workspace.cwd;
+        }
+        const candidates = Array.isArray(workspace && workspace.candidates) ? workspace.candidates : [];
+        if (candidates.length > 0) {
+          setWorkspaceChoices(candidates);
+          const pick = new Error('请选择一个项目工作区');
+          pick.code = 'WORKSPACE_PICK_REQUIRED';
+          throw pick;
+        }
+        throw (workspace && workspace.error) || new Error('当前没有带工作区的项目会话；请在本窗口打开或新建一个项目会话，然后点“刷新”');
+      }
+      async function pickWorkspace(choice) {
+        setWorkspaceChoices(null);
+        await load(false, choice.cwd);
+      }
+      async function switchWorkspace() {
+        setCwd('');
+        setWorkspaceChoices(null);
+        setSessionId(typeof scopedSessionId === 'string' && scopedSessionId ? scopedSessionId : '');
+        try {
+          const next = await resolveWorkspace();
+          if (next) await load(true, next);
+        } catch { /* the picker or the empty hint is now visible */ }
       }
       async function load(quiet, requestedCwd) {
         setBusy('snapshot'); if (!quiet) setFeedback(null);
@@ -214,10 +242,13 @@ window.__ModuleLoader__.load({
           const nextCwd = next && (next.cwd || next.workingDirectory || next.root);
           if (nextCwd) setCwd(nextCwd);
           if (!bootstrap.taskId && next && next.task && (next.task.id || next.task.task_id)) setBootstrap(v => ({ ...v, taskId: next.task.id || next.task.task_id }));
-        } catch (error) { setFeedback(errorInfo(error)); }
+        } catch (error) {
+          // The picker itself is the UI for this state; no error banner.
+          if (error && error.code !== 'WORKSPACE_PICK_REQUIRED') setFeedback(errorInfo(error));
+        }
         finally { setBusy(''); }
       }
-      useEffect(() => { let live = true; resolveWorkspace().then(activeCwd => { if (live) return load(true, activeCwd); return null; }).catch(error => { if (live) setFeedback(errorInfo(error)); }); return () => { live = false; }; }, [api]);
+      useEffect(() => { let live = true; resolveWorkspace().then(activeCwd => { if (live) return load(true, activeCwd); return null; }).catch(error => { if (live && error && error.code !== 'WORKSPACE_PICK_REQUIRED') setFeedback(errorInfo(error)); }); return () => { live = false; }; }, [api]);
 
       async function doBootstrap() {
         const criteria = bootstrap.criteria.split('\n').map(x => x.trim()).filter(Boolean);
@@ -226,7 +257,7 @@ window.__ModuleLoader__.load({
       }
       function requireSession(label) {
         if (!sessionId) {
-          const error = new Error('无法确定当前会话；请从项目会话窗口打开本面板');
+          const error = new Error('本面板需要知道当前会话；请在项目会话激活的窗口中使用，然后点“刷新”');
           error.code = 'SESSION_REQUIRED';
           setFeedback(errorInfo(error));
           return null;
@@ -359,7 +390,11 @@ window.__ModuleLoader__.load({
 
       return h('main', { className: 'pm-root' }, h('style', null, CSS), h('div', { className: 'pm-shell' },
         h('header', { className: 'pm-header' }, h('div', null, h('h1', { className: 'pm-title' }, TEXT.title), h('p', { className: 'pm-subtitle' }, initialized ? `本地 SQLite · ${first(data && (data.branch || data.git_branch), '当前分支')}` : TEXT.uninitialized)), h('div', { className: 'pm-actions' }, button(busy === 'snapshot' ? TEXT.refreshing : TEXT.refresh, () => load(false), false, Boolean(busy)))),
-        h('div', { className: 'pm-workspace' }, h('span', { className: 'pm-workspace-label' }, TEXT.cwd), h('code', { className: 'pm-workspace-path' }, cwd || '等待当前会话的工作区…')),
+        h('div', { className: 'pm-workspace' }, h('span', { className: 'pm-workspace-label' }, TEXT.cwd), h('code', { className: 'pm-workspace-path' }, cwd || '等待选择项目工作区…'), cwd ? button('切换项目', switchWorkspace, false, Boolean(busy)) : null),
+        workspaceChoices && workspaceChoices.length ? section('选择项目工作区', rows(workspaceChoices, item => h('li', { className: 'pm-row', key: item.sessionId || item.cwd },
+          h('div', null, h('div', { className: 'pm-row-title pm-code' }, item.cwd), h('div', { className: 'pm-row-detail' }, `会话 ${item.sessionId ?? '—'}`)),
+          button('打开此项目', () => pickWorkspace(item), true, Boolean(busy)),
+        ), 'Host 没有报告任何候选')) : null,
         h(Feedback, { value: feedback, onReload: () => load(false) }),
         initialized ? h(React.Fragment, null, saveBar, h('nav', { className: 'pm-tabs', 'aria-label': '项目记忆视图' }, tabs.map(([id, label]) => h('button', { type: 'button', role: 'tab', className: 'pm-tab', 'aria-selected': tab === id, key: id, onClick: () => setTab(id) }, label))), tab === 'overview' ? overview : tab === 'tasks' ? taskView : tab === 'contracts' ? contractView : historyView) : bootstrapView
       ));

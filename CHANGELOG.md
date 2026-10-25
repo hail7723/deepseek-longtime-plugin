@@ -25,6 +25,14 @@ All notable changes to this project will be documented in this file.
 
 - Do not read the non-injected Harness `ctx.config` property during `agent/created`; this previously prevented real session creation with `cannot get property "config" without inject`.
 
+## [0.3.0-dev.5] - 2026-10-25
+
+### Changed
+
+- When the Host cannot map exactly one workspace (welcome page with no live project conversation, or several live ones), the panel now shows an explicit "选择项目工作区" candidate picker instead of an error; picking one loads that project, and a "切换项目" button re-opens the picker. Auto-selection order is unchanged: slot-scoped session id first, sole live workspace second.
+- Rewrote the workspace/session error copy: it now tells the user to open or select a project conversation and refresh — the panel itself always stays in the sidebar.
+- New client render test drives the picker through the real slot wrapper (the Remote-namespace injection path), asserting both candidates render and a pick requests that exact cwd.
+
 ## [0.3.0-dev.4] - 2026-10-25
 
 Remediation R00 + R01 + R02. Evidence: `docs/v0.3-lease-and-session-evidence.md`.
