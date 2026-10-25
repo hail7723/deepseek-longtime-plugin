@@ -101,7 +101,7 @@ test('real Client Gateway mounts, invokes Host Gateway and disposes the memory n
   assert.equal(proposal.ok, true, JSON.stringify(proposal));
   const candidateView = await panelApi('snapshot', { cwd: directory });
   assert.equal(candidateView.contractCandidates.length, 1);
-  assert.equal(candidateView.contractCandidates[0].eventSeq, proposal.event.seq);
+  assert.equal(candidateView.contractCandidates[0].id, proposal.candidate.id);
   assert.equal(candidateView.contract.objective, 'Ship panel');
   const found = await panelApi('search', { cwd: directory, task_id: 'ui-task', query: 'Gateway checkpoint' });
   assert.equal(found.ok, true);

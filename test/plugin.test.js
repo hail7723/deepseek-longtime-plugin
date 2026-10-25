@@ -95,8 +95,7 @@ test('new agents and repeated context refreshes observe latest SQLite checkpoint
   assert.equal(providerA.required, true);
   for (let simulatedCompaction = 0; simulatedCompaction < 3; simulatedCompaction += 1) {
     const text = providerA.text();
-    assert.match(text, /TASK_REV: 2/);
-    assert.match(text, /CONTRACT_REV: 1/);
+    assert.match(text, /Revisions \/ workspace \/ branch \/ code: 2\/1/);
     assert.match(text, /SQLite checkpoint committed/);
   }
 
@@ -104,7 +103,7 @@ test('new agents and repeated context refreshes observe latest SQLite checkpoint
   const disposeB = registerAgent(b.agent, root, logger);
   t.after(disposeB);
   const providerB = b.contexts.get('project-memory:recovery');
-  assert.match(providerB.text(), /TASK: task-1/);
+  assert.match(providerB.text(), /\/ task-1 \(active\)/);
   assert.match(providerB.text(), /run integration test/);
 
   const stale = await callTool(b, 'memory_claim', { expected_revision: 1, lease_seconds: 60 });
@@ -165,8 +164,7 @@ test('pending tool operations survive a simulated crash and appear in recovery',
   const disposeB = registerAgent(b.agent, root, logger);
   t.after(disposeB);
   const recovery = b.contexts.get('project-memory:recovery').text();
-  assert.match(recovery, /tool\.pending/);
-  assert.match(recovery, /call-before-crash/);
+  assert.match(recovery, /Pending or unknown external operations: write \(pending\)/);
 });
 
 test('database failure is surfaced and never reported as a successful read', async (t) => {

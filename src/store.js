@@ -3,7 +3,15 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const TASK_STATES = new Set(['active', 'paused', 'blocked', 'completed', 'archived']);
+const TRANSITIONS = Object.freeze({
+  active: new Set(['paused', 'blocked', 'completed', 'archived']),
+  paused: new Set(['active', 'blocked', 'completed', 'archived']),
+  blocked: new Set(['active', 'paused', 'completed', 'archived']),
+  completed: new Set(['archived']),
+  archived: new Set([]),
+});
 const DEFAULT_MARKER_DIR = '.deepseek-memory';
 const DEFAULT_MARKER_FILE = 'project.json';
 const DEFAULT_DATABASE_FILE = 'memory.sqlite';
@@ -85,9 +93,35 @@ function mapTask(row) {
     leaseOwner: row.lease_owner,
     leaseFence: Number(row.lease_fence),
     leaseExpiresAt: row.lease_expires_at == null ? null : Number(row.lease_expires_at),
+    displayOrder: Number(row.display_order ?? 0),
+    lastCheckpointAt: row.last_checkpoint_at ?? null,
+    lastActivityAt: row.last_activity_at ?? null,
+    supersededByTaskId: row.superseded_by_task_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function mapBinding(row) {
+  if (!row) return null;
+  return { sessionId: row.session_id, projectId: row.project_id, taskId: row.task_id,
+    workspaceId: row.workspace_id, boundAt: row.bound_at, lastSeenAt: row.last_seen_at,
+    bindingSource: row.binding_source };
+}
+
+function mapCandidate(row) {
+  if (!row) return null;
+  return { id: row.id, projectId: row.project_id, taskId: row.task_id,
+    baseContractVersion: Number(row.base_contract_version), diff: decode(row.diff_json),
+    sourceRef: decode(row.source_ref_json), status: row.status, createdAt: row.created_at,
+    decidedAt: row.decided_at, decidedBy: row.decided_by };
+}
+
+function mapToolOperation(row) {
+  if (!row) return null;
+  return { callId: row.call_id, sessionId: row.session_id, taskId: row.task_id,
+    toolName: row.tool_name, status: row.status, startedAt: row.started_at,
+    finishedAt: row.finished_at, resultSummary: decode(row.result_summary_json), evidenceRef: row.evidence_ref };
 }
 
 function mapEvent(row) {
@@ -166,7 +200,7 @@ class ProjectMemoryStore {
       marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
     } else {
       marker = {
-        schema_version: SCHEMA_VERSION,
+        schema_version: 1,
         project_id: options.projectId ?? randomUUID(),
         created_at: nowIso(),
       };
@@ -176,23 +210,45 @@ class ProjectMemoryStore {
         fs.renameSync(temporaryPath, markerPath);
       } catch (error) {
         fs.rmSync(temporaryPath, { force: true });
-        if (!fs.existsSync(markerPath)) throw error;
+        // Some Windows sandbox mounts prohibit atomic rename inside Temp.  A
+        // direct exclusive create still preserves the no-overwrite invariant
+        // and lets the test/runtime report a normal filesystem error if it
+        // cannot create the marker.
+        if (!fs.existsSync(markerPath)) {
+          try { fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx' }); }
+          catch (writeError) { if (!fs.existsSync(markerPath)) throw writeError; }
+        }
         marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
       }
     }
 
     const markerSchemaVersion = marker.schema_version ?? marker.schemaVersion;
     const markerProjectId = marker.project_id ?? marker.projectId;
-    if (markerSchemaVersion !== SCHEMA_VERSION || typeof markerProjectId !== 'string') {
+    if (![1, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
       throw new StoreError(`Invalid project marker at ${markerPath}`, 'INVALID_PROJECT_MARKER', { markerPath });
     }
     const databasePath = options.databasePath ?? path.join(stateDirectory, DEFAULT_DATABASE_FILE);
+    // A v1 database is never changed without a same-directory recovery copy.  Keep
+    // WAL sidecars too: they can contain the most recent v1 transactions.
+    if (markerSchemaVersion === 1 && fs.existsSync(databasePath)) {
+      const backup = `${databasePath}.v1-backup`;
+      if (!fs.existsSync(backup)) {
+        fs.copyFileSync(databasePath, backup);
+        for (const suffix of ['-wal', '-shm']) {
+          if (fs.existsSync(`${databasePath}${suffix}`)) fs.copyFileSync(`${databasePath}${suffix}`, `${backup}${suffix}`);
+        }
+      }
+    }
     const store = new ProjectMemoryStore(databasePath, options);
     const project = store.ensureProject({
       id: markerProjectId,
       rootPath,
       markerId: markerProjectId,
     });
+    if (markerSchemaVersion !== SCHEMA_VERSION && !(options.readOnly ?? false)) {
+      const upgraded = { ...marker, schema_version: SCHEMA_VERSION, migrated_from: markerSchemaVersion, migrated_at: nowIso() };
+      fs.writeFileSync(markerPath, `${JSON.stringify(upgraded, null, 2)}\n`);
+    }
     return { store, project, markerPath, databasePath };
   }
 
@@ -202,7 +258,7 @@ class ProjectMemoryStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       ) STRICT;
-      INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}');
+      INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
 
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -283,6 +339,61 @@ class ProjectMemoryStore {
         PRIMARY KEY(project_id, idempotency_key)
       ) STRICT;
     `);
+    const version = Number(this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get()?.value ?? 1);
+    if (version > SCHEMA_VERSION) throw new StoreError('Database schema is newer than this plugin', 'SCHEMA_TOO_NEW', { version });
+    if (version < 2) {
+      // All changes are additive or value-preserving.  The surrounding constructor
+      // has already made the v1 backup; this transaction makes a failed migration
+      // reopenable as v1.
+      this.#transaction(() => {
+        const columns = new Set(this.db.prepare('PRAGMA table_info(tasks)').all().map(row => row.name));
+        if (!columns.has('display_order')) this.db.exec('ALTER TABLE tasks ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0');
+        if (!columns.has('last_checkpoint_at')) this.db.exec('ALTER TABLE tasks ADD COLUMN last_checkpoint_at TEXT');
+        if (!columns.has('last_activity_at')) this.db.exec('ALTER TABLE tasks ADD COLUMN last_activity_at TEXT');
+        if (!columns.has('superseded_by_task_id')) this.db.exec('ALTER TABLE tasks ADD COLUMN superseded_by_task_id TEXT');
+        this.db.exec(`
+          UPDATE tasks SET state = 'paused' WHERE state NOT IN ('active', 'paused', 'blocked', 'completed', 'archived');
+          UPDATE tasks SET display_order = rowid WHERE display_order = 0;
+          CREATE TABLE IF NOT EXISTS session_bindings (
+            session_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, bound_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL, binding_source TEXT NOT NULL,
+            PRIMARY KEY(session_id, project_id, workspace_id),
+            FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS session_bindings_lookup ON session_bindings(project_id, workspace_id, last_seen_at);
+          CREATE TABLE IF NOT EXISTS contract_candidates (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL, base_contract_version INTEGER NOT NULL, diff_json TEXT NOT NULL,
+            source_ref_json TEXT, status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected','superseded')),
+            created_at TEXT NOT NULL, decided_at TEXT, decided_by TEXT,
+            FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS contract_candidates_pending ON contract_candidates(project_id, task_id, status);
+          CREATE TABLE IF NOT EXISTS tool_operations (
+            call_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','succeeded','failed','unknown')),
+            started_at TEXT NOT NULL, finished_at TEXT, result_summary_json TEXT, evidence_ref TEXT
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS tool_operations_task ON tool_operations(task_id, status, started_at);
+        `);
+        // Preserve v1 candidate events as auditable v2 records. Duplicate bodies are
+        // retained and marked superseded instead of silently discarded.
+        for (const event of this.db.prepare("SELECT * FROM events WHERE type = 'contract.change-proposed' ORDER BY project_id, seq").all()) {
+          const payload = decode(event.payload_json) ?? {};
+          const duplicate = this.db.prepare('SELECT id FROM contract_candidates WHERE project_id = ? AND task_id = ? AND diff_json = ? LIMIT 1')
+            .get(event.project_id, event.task_id, encode(payload.proposal ?? payload.diff ?? {}));
+          this.db.prepare(`INSERT OR IGNORE INTO contract_candidates(
+            id, project_id, task_id, base_contract_version, diff_json, source_ref_json, status, created_at, decided_at, decided_by
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(`legacy-event-${event.project_id}-${event.seq}`, event.project_id, event.task_id,
+              Number(payload.expectedContractRevision ?? 1), encode(payload.proposal ?? payload.diff ?? {}),
+              payload.sourceRef == null ? null : encode(payload.sourceRef), duplicate ? 'superseded' : 'pending',
+              event.created_at, duplicate ? event.created_at : null, duplicate ? 'migration:duplicate' : null);
+        }
+        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+      });
+    }
   }
 
   close() {
@@ -326,7 +437,7 @@ class ProjectMemoryStore {
     projectId,
     id = randomUUID(),
     title = '',
-    state = 'pending',
+    state = 'active',
     data = {},
     contract = {},
     branch = null,
@@ -335,14 +446,16 @@ class ProjectMemoryStore {
   }) {
     requireString(projectId, 'projectId');
     requireString(id, 'id');
+    if (!TASK_STATES.has(state)) throw new TypeError(`Invalid task state: ${state}`);
     return this.#writeIdempotent(projectId, 'create-task', idempotencyKey, () => {
       const timestamp = nowIso();
+      const displayOrder = Number(this.db.prepare('SELECT COALESCE(MAX(display_order), 0) + 1 AS next FROM tasks WHERE project_id = ?').get(projectId).next);
       this.db.prepare(`
         INSERT INTO tasks(
           id, project_id, title, state, data_json, contract_json,
-          branch, workspace, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, projectId, title, state, encode(data), encode(contract), branch, workspace, timestamp, timestamp);
+          branch, workspace, display_order, last_activity_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, projectId, title, state, encode(data), encode(contract), branch, workspace, displayOrder, timestamp, timestamp, timestamp);
       const event = this.#appendEvent(projectId, id, 'task.created', {
         title, state, data, contract, branch, workspace,
       });
@@ -356,9 +469,116 @@ class ProjectMemoryStore {
 
   listTasks(projectId, options = {}) {
     const rows = options.state === undefined
-      ? this.db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at, id').all(projectId)
-      : this.db.prepare('SELECT * FROM tasks WHERE project_id = ? AND state = ? ORDER BY created_at, id').all(projectId, options.state);
+      ? this.db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY display_order, created_at, id').all(projectId)
+      : this.db.prepare('SELECT * FROM tasks WHERE project_id = ? AND state = ? ORDER BY display_order, created_at, id').all(projectId, options.state);
     return rows.map(mapTask);
+  }
+
+  getSessionBinding({ sessionId, projectId, workspaceId }) {
+    requireString(sessionId, 'sessionId'); requireString(projectId, 'projectId'); requireString(workspaceId, 'workspaceId');
+    return mapBinding(this.db.prepare(`SELECT * FROM session_bindings
+      WHERE session_id = ? AND project_id = ? AND workspace_id = ?`).get(sessionId, projectId, workspaceId));
+  }
+
+  bindSession({ sessionId, projectId, taskId, workspaceId, source = 'explicit' }) {
+    requireString(sessionId, 'sessionId'); requireString(projectId, 'projectId'); requireString(taskId, 'taskId'); requireString(workspaceId, 'workspaceId');
+    if (!['explicit', 'sole-open-task', 'migrated'].includes(source)) throw new TypeError('Invalid binding source');
+    return this.#transaction(() => {
+      const task = this.#requireTask(projectId, taskId);
+      if (task.state === 'archived') throw new StoreError('Archived tasks cannot be bound', 'TASK_ARCHIVED', { taskId });
+      const timestamp = nowIso();
+      this.db.prepare(`INSERT INTO session_bindings(session_id, project_id, task_id, workspace_id, bound_at, last_seen_at, binding_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, project_id, workspace_id) DO UPDATE SET task_id=excluded.task_id, last_seen_at=excluded.last_seen_at, binding_source=excluded.binding_source`)
+        .run(sessionId, projectId, taskId, workspaceId, timestamp, timestamp, source);
+      this.#appendEvent(projectId, taskId, 'session.bound', { sessionId, workspaceId, source });
+      return this.getSessionBinding({ sessionId, projectId, workspaceId });
+    });
+  }
+
+  touchSessionBinding({ sessionId, projectId, workspaceId }) {
+    const binding = this.getSessionBinding({ sessionId, projectId, workspaceId });
+    if (!binding) return null;
+    const task = this.getTask(projectId, binding.taskId);
+    if (!task || task.state === 'archived') return null;
+    this.db.prepare('UPDATE session_bindings SET last_seen_at = ? WHERE session_id = ? AND project_id = ? AND workspace_id = ?')
+      .run(nowIso(), sessionId, projectId, workspaceId);
+    return this.getSessionBinding({ sessionId, projectId, workspaceId });
+  }
+
+  listContractCandidates({ projectId, taskId, status }) {
+    const clauses = ['project_id = ?']; const params = [projectId];
+    if (taskId !== undefined) { clauses.push('task_id = ?'); params.push(taskId); }
+    if (status !== undefined) { clauses.push('status = ?'); params.push(status); }
+    return this.db.prepare(`SELECT * FROM contract_candidates WHERE ${clauses.join(' AND ')} ORDER BY created_at, id`).all(...params).map(mapCandidate);
+  }
+
+  createContractCandidate({ projectId, taskId, baseContractVersion, diff, sourceRef, id = randomUUID(), idempotencyKey }) {
+    requireString(projectId, 'projectId'); requireString(taskId, 'taskId'); requireString(id, 'id');
+    if (!Number.isSafeInteger(baseContractVersion) || baseContractVersion < 1) throw new TypeError('baseContractVersion must be positive');
+    if (!diff || typeof diff !== 'object' || Array.isArray(diff)) throw new TypeError('diff must be an object');
+    return this.#writeIdempotent(projectId, 'create-contract-candidate', idempotencyKey, () => {
+      const task = this.#requireTask(projectId, taskId);
+      if (task.contractVersion !== baseContractVersion) this.#throwTaskConflict(projectId, taskId, baseContractVersion, 'contract');
+      const timestamp = nowIso();
+      this.db.prepare(`INSERT INTO contract_candidates(id, project_id, task_id, base_contract_version, diff_json, source_ref_json, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`)
+        .run(id, projectId, taskId, baseContractVersion, encode(diff), sourceRef == null ? null : encode(sourceRef), timestamp);
+      const event = this.#appendEvent(projectId, taskId, 'contract.change-proposed', { candidateId: id, diff, baseContractVersion });
+      return { candidate: mapCandidate(this.db.prepare('SELECT * FROM contract_candidates WHERE id = ?').get(id)), event };
+    });
+  }
+
+  decideContractCandidate({ projectId, candidateId, decision, decidedBy = 'user', idempotencyKey }) {
+    if (!['accepted', 'rejected'].includes(decision)) throw new TypeError('decision must be accepted or rejected');
+    return this.#writeIdempotent(projectId, 'decide-contract-candidate', idempotencyKey, () => {
+      const row = this.db.prepare('SELECT * FROM contract_candidates WHERE id = ? AND project_id = ?').get(candidateId, projectId);
+      const candidate = mapCandidate(row);
+      if (!candidate) throw new StoreError('Contract candidate not found', 'NOT_FOUND', { candidateId });
+      if (candidate.status !== 'pending') throw new ConflictError('Contract candidate was already decided', 'CANDIDATE_DECISION_CONFLICT', { candidateId, status: candidate.status });
+      const task = this.#requireTask(projectId, candidate.taskId);
+      if (decision === 'accepted' && task.contractVersion !== candidate.baseContractVersion) {
+        this.#throwTaskConflict(projectId, task.id, candidate.baseContractVersion, 'contract');
+      }
+      const timestamp = nowIso();
+      if (decision === 'accepted') {
+        const contract = { ...task.contract, ...candidate.diff };
+        this.db.prepare(`UPDATE tasks SET contract_json = ?, contract_version = contract_version + 1, updated_at = ?, last_activity_at = ?
+          WHERE project_id = ? AND id = ? AND contract_version = ?`).run(encode(contract), timestamp, timestamp, projectId, task.id, task.contractVersion);
+        this.db.prepare(`UPDATE contract_candidates SET status = 'superseded', decided_at = ?, decided_by = ?
+          WHERE project_id = ? AND task_id = ? AND status = 'pending' AND id <> ?`).run(timestamp, 'candidate-accepted', projectId, task.id, candidateId);
+      }
+      this.db.prepare('UPDATE contract_candidates SET status = ?, decided_at = ?, decided_by = ? WHERE id = ?')
+        .run(decision, timestamp, decidedBy, candidateId);
+      const updatedTask = this.#requireTask(projectId, task.id);
+      const event = this.#appendEvent(projectId, task.id, `contract.candidate-${decision}`, { candidateId, decidedBy, contractVersion: updatedTask.contractVersion });
+      return { candidate: mapCandidate(this.db.prepare('SELECT * FROM contract_candidates WHERE id = ?').get(candidateId)), task: updatedTask, event };
+    });
+  }
+
+  beginToolOperation({ callId, sessionId, taskId, toolName }) {
+    requireString(callId, 'callId'); requireString(sessionId, 'sessionId'); requireString(taskId, 'taskId'); requireString(toolName, 'toolName');
+    this.db.prepare(`INSERT INTO tool_operations(call_id, session_id, task_id, tool_name, status, started_at)
+      VALUES (?, ?, ?, ?, 'pending', ?) ON CONFLICT(call_id) DO NOTHING`).run(callId, sessionId, taskId, toolName, nowIso());
+    return mapToolOperation(this.db.prepare('SELECT * FROM tool_operations WHERE call_id = ?').get(callId));
+  }
+
+  finishToolOperation({ callId, status, resultSummary = null, evidenceRef = null }) {
+    if (!['succeeded', 'failed', 'unknown'].includes(status)) throw new TypeError('Invalid tool operation status');
+    this.db.prepare(`UPDATE tool_operations SET status = ?, finished_at = ?, result_summary_json = ?, evidence_ref = ?
+      WHERE call_id = ? AND status = 'pending'`).run(status, nowIso(), resultSummary == null ? null : encode(resultSummary), evidenceRef, callId);
+    return mapToolOperation(this.db.prepare('SELECT * FROM tool_operations WHERE call_id = ?').get(callId));
+  }
+
+  listToolOperations({ taskId, statuses = undefined }) {
+    const params = [taskId]; let suffix = '';
+    if (statuses?.length) { suffix = ` AND status IN (${statuses.map(() => '?').join(',')})`; params.push(...statuses); }
+    return this.db.prepare(`SELECT * FROM tool_operations WHERE task_id = ?${suffix} ORDER BY started_at, call_id`).all(...params).map(mapToolOperation);
+  }
+
+  markPendingOperationsUnknown({ sessionId, taskId }) {
+    this.db.prepare(`UPDATE tool_operations SET status = 'unknown', finished_at = ? WHERE session_id = ? AND task_id = ? AND status = 'pending'`)
+      .run(nowIso(), sessionId, taskId);
   }
 
   updateTask({ projectId, taskId, expectedVersion, patch, idempotencyKey, lease }) {
@@ -383,11 +603,12 @@ class ProjectMemoryStore {
         });
       }
       const next = { ...current, ...patch };
+      this.#assertTransition(current.state, next.state);
       const result = this.db.prepare(`
         UPDATE tasks SET title = ?, state = ?, data_json = ?, branch = ?, workspace = ?,
-          task_version = task_version + 1, updated_at = ?
+          task_version = task_version + 1, last_activity_at = ?, updated_at = ?
         WHERE project_id = ? AND id = ? AND task_version = ?
-      `).run(next.title, next.state, encode(next.data), next.branch, next.workspace, nowIso(), projectId, taskId, expectedVersion);
+      `).run(next.title, next.state, encode(next.data), next.branch, next.workspace, nowIso(), nowIso(), projectId, taskId, expectedVersion);
       if (Number(result.changes) !== 1) this.#throwTaskConflict(projectId, taskId, expectedVersion, 'task');
       const event = this.#appendEvent(projectId, taskId, 'task.updated', { patch, previousVersion: expectedVersion });
       return { task: this.getTask(projectId, taskId), event };
@@ -612,9 +833,10 @@ class ProjectMemoryStore {
       this.#assertLease(current, lease);
 
       const next = { ...current, ...taskPatch };
+      this.#assertTransition(current.state, next.state);
       const updated = this.db.prepare(`
         UPDATE tasks SET title = ?, state = ?, data_json = ?, branch = ?, workspace = ?,
-          task_version = task_version + 1, updated_at = ?
+          task_version = task_version + 1, last_activity_at = ?, updated_at = ?
         WHERE project_id = ? AND id = ? AND task_version = ? AND contract_version = ?
       `).run(
         next.title,
@@ -622,6 +844,7 @@ class ProjectMemoryStore {
         encode(next.data),
         next.branch,
         next.workspace,
+        nowIso(),
         nowIso(),
         projectId,
         taskId,
@@ -705,6 +928,8 @@ class ProjectMemoryStore {
         nowIso(),
       );
       const checkpoint = mapCheckpoint(this.db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(checkpointId));
+      this.db.prepare('UPDATE tasks SET last_checkpoint_at = ?, last_activity_at = ?, updated_at = ? WHERE project_id = ? AND id = ?')
+        .run(checkpoint.createdAt, checkpoint.createdAt, checkpoint.createdAt, projectId, taskId);
       return {
         task: committedTask,
         evidence: storedEvidence,
@@ -879,6 +1104,13 @@ class ProjectMemoryStore {
         taskId: task.id,
         actualFence: task.leaseFence,
       });
+    }
+  }
+
+  #assertTransition(previous, next) {
+    if (!TASK_STATES.has(next)) throw new StoreError(`Invalid task state: ${next}`, 'INVALID_TASK_STATE', { state: next });
+    if (previous !== next && !TRANSITIONS[previous]?.has(next)) {
+      throw new ConflictError(`Task cannot transition from ${previous} to ${next}`, 'INVALID_TASK_TRANSITION', { previous, next });
     }
   }
 

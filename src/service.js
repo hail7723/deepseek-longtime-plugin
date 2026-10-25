@@ -27,7 +27,7 @@ function presentSnapshot(snapshot, lease) {
   if (!snapshot?.ok || !snapshot.initialized) return snapshot;
   const task = snapshot.task;
   const events = snapshot.recentEvents ?? [];
-  const contractCandidates = events
+  const contractCandidates = snapshot.contractCandidates ?? events
     .filter((event) => event.type === 'contract.change-proposed' && event.payload?.status === 'candidate' && event.taskId === task?.id)
     .map((event) => ({
       id: event.seq,

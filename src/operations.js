@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { openProjectStore } from './store.js';
 
@@ -78,7 +78,11 @@ function workspaceFacts(projectRoot, cwd) {
   } catch {
     git = { branch: 'unknown', codeRevision: null };
   }
-  const canonical = path.resolve(cwd).toLowerCase();
+  // A workspace is the checked-out project, not the directory from which an
+  // agent happened to start.  realpath also folds symlink aliases on Windows.
+  let canonical;
+  try { canonical = fs.realpathSync.native(projectRoot); } catch { canonical = path.resolve(projectRoot); }
+  canonical = canonical.toLowerCase();
   const digest = createHash('sha256').update(canonical).digest('hex').slice(0, 20);
   return { workspaceId: `local:${digest}`, ...git };
 }
@@ -138,6 +142,10 @@ function requireProjectRoot(cwd) {
   return root;
 }
 
+function openTasks(store, projectId) {
+  return store.listTasks(projectId).filter(task => !['completed', 'archived'].includes(task.state));
+}
+
 function selectTask(store, projectId, taskId) {
   if (taskId !== undefined && taskId !== null) {
     requireString(taskId, 'taskId');
@@ -151,11 +159,26 @@ function selectTask(store, projectId, taskId) {
     }
     return task;
   }
-  const tasks = store.listTasks(projectId);
-  return tasks.find((task) => task.state === 'active') ?? tasks[0] ?? null;
+  const tasks = openTasks(store, projectId);
+  return tasks.length === 1 ? tasks[0] : null;
 }
 
-function readProjectSnapshot({ cwd, taskId, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT } = {}) {
+function resolveTask(store, projectId, { taskId, sessionId, workspaceId }) {
+  if (taskId !== undefined && taskId !== null) return { task: selectTask(store, projectId, taskId), source: 'explicit', selectionRequired: false };
+  if (sessionId) {
+    const binding = store.touchSessionBinding({ sessionId, projectId, workspaceId });
+    if (binding) return { task: store.getTask(projectId, binding.taskId), source: binding.bindingSource, selectionRequired: false };
+  }
+  const candidates = openTasks(store, projectId);
+  if (candidates.length === 1) {
+    const task = candidates[0];
+    if (sessionId) store.bindSession({ sessionId, projectId, taskId: task.id, workspaceId, source: 'sole-open-task' });
+    return { task, source: 'sole-open-task', selectionRequired: false };
+  }
+  return { task: null, source: null, selectionRequired: candidates.length > 1, candidates };
+}
+
+function readProjectSnapshot({ cwd, taskId, sessionId, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
     if (!Number.isSafeInteger(sinceEventSeq) || sinceEventSeq < 0) {
@@ -168,9 +191,10 @@ function readProjectSnapshot({ cwd, taskId, sinceEventSeq = 0, eventLimit = DEFA
     }
     return withStore(projectRoot, (store) => {
       const projectId = store.project.id;
-      const task = selectTask(store, projectId, taskId);
-      const tasks = store.listTasks(projectId);
       const facts = workspaceFacts(projectRoot, currentDirectory);
+      const resolution = resolveTask(store, projectId, { taskId, sessionId, workspaceId: facts.workspaceId });
+      const task = resolution.task;
+      const tasks = store.listTasks(projectId);
       return {
         ok: true,
         initialized: true,
@@ -179,6 +203,9 @@ function readProjectSnapshot({ cwd, taskId, sinceEventSeq = 0, eventLimit = DEFA
         project: store.getProject(projectId),
         tasks,
         task,
+        selectionRequired: resolution.selectionRequired,
+        taskCandidates: resolution.candidates ?? [],
+        bindingSource: resolution.source,
         checkpoint: task === null ? null : store.latestCheckpoint(projectId, {
           taskId: task.id,
           branch: facts.branch,
@@ -191,6 +218,8 @@ function readProjectSnapshot({ cwd, taskId, sinceEventSeq = 0, eventLimit = DEFA
           workspace: facts.workspaceId,
         }),
         recentEvents: store.listEvents(projectId, { afterSeq: sinceEventSeq, limit: eventLimit }),
+        contractCandidates: task ? store.listContractCandidates({ projectId, taskId: task.id }) : [],
+        toolOperations: task ? store.listToolOperations({ taskId: task.id }) : [],
         ...facts,
       };
     });
@@ -206,6 +235,7 @@ function bootstrap({
   nextAction = null,
   sourceRef = null,
   idempotencyKey,
+  sessionId,
 } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
@@ -237,6 +267,7 @@ function bootstrap({
           idempotencyKey,
         }).task;
       }
+      if (sessionId) store.bindSession({ sessionId, projectId, taskId: task.id, workspaceId: facts.workspaceId, source: 'explicit' });
       return {
         ok: true,
         initialized: true,
@@ -245,6 +276,44 @@ function bootstrap({
         task,
         ...facts,
       };
+    });
+  });
+}
+
+function startTask({ cwd, sessionId, objective, acceptanceCriteria = [], constraints = [], nextAction = null, sourceRef = null, idempotencyKey, taskId = randomUUID() } = {}) {
+  return bootstrap({ cwd, sessionId, taskId, objective, acceptanceCriteria, constraints, nextAction, sourceRef, idempotencyKey });
+}
+
+function useTask({ cwd, sessionId, taskId } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId'); requireString(taskId, 'taskId');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, (store) => {
+      const facts = workspaceFacts(projectRoot, currentDirectory); const projectId = store.project.id;
+      const binding = store.bindSession({ sessionId, projectId, taskId, workspaceId: facts.workspaceId, source: 'explicit' });
+      return { ok: true, projectId, task: store.getTask(projectId, taskId), binding, ...facts };
+    });
+  });
+}
+
+function listTasks({ cwd } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => ({ ok: true, projectId: store.project.id, tasks: store.listTasks(store.project.id) }));
+  });
+}
+
+function setTaskState({ cwd, taskId, state, owner = 'project-memory-admin', expectedRevision } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(taskId, 'taskId'); requireString(state, 'state');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => {
+      const projectId = store.project.id; const task = selectTask(store, projectId, taskId);
+      const revision = expectedRevision ?? task.taskVersion; requireNonNegativeInteger(revision, 'expectedRevision');
+      const lease = store.acquireLease({ projectId, taskId, owner, ttlMs: 300000 });
+      const result = store.updateTask({ projectId, taskId, expectedVersion: revision, patch: { state }, lease, idempotencyKey: `state:${taskId}:${revision}:${state}` });
+      if (['paused', 'completed', 'archived'].includes(state)) store.releaseLease({ projectId, taskId, owner, fence: lease.fence });
+      return { ok: true, projectId, ...result };
     });
   });
 }
@@ -351,6 +420,39 @@ function checkpoint({
   });
 }
 
+// The public model API intentionally does not accept revisions or fencing
+// tokens.  It acquires a fresh lease, reads the current versions, and lets the
+// store's single transaction reject a concurrent semantic overwrite.
+function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [], acceptanceUpdates = [], evidenceRefs = [], state, idempotencyKey } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId');
+    if (!Array.isArray(blockers) || !Array.isArray(acceptanceUpdates) || !Array.isArray(evidenceRefs)) throw new TypeError('commit lists must be arrays');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => {
+      const projectId = store.project.id; const facts = workspaceFacts(projectRoot, currentDirectory);
+      const resolution = resolveTask(store, projectId, { sessionId, workspaceId: facts.workspaceId });
+      if (!resolution.task) {
+        const error = new Error(resolution.selectionRequired ? 'Choose a task before committing' : 'No open task is available');
+        error.code = resolution.selectionRequired ? 'TASK_SELECTION_REQUIRED' : 'NOT_FOUND';
+        error.candidates = resolution.candidates?.map(item => ({ id: item.id, title: item.title, state: item.state }));
+        throw error;
+      }
+      const task = resolution.task;
+      const lease = store.acquireLease({ projectId, taskId: task.id, owner: `project-memory:${sessionId}`, ttlMs: 300000 });
+      const latest = store.getTask(projectId, task.id);
+      const data = { ...latest.data, blockers, acceptanceUpdates, nextAction };
+      const result = store.commitCheckpoint({
+        projectId, taskId: latest.id, expectedTaskVersion: latest.taskVersion, expectedContractVersion: latest.contractVersion,
+        lease, taskPatch: { ...(state ? { state } : {}), data },
+        evidence: evidenceRefs.map(ref => ({ kind: 'reference', payload: { ref } })),
+        checkpointPayload: { summary: String(progress), nextAction, blockers, acceptanceUpdates, evidenceRefs, sessionId },
+        branch: facts.branch, workspace: facts.workspaceId, idempotencyKey: idempotencyKey ?? `commit:${sessionId}:${latest.id}:${latest.taskVersion}`,
+      });
+      return { ok: true, projectId, taskId: latest.id, ...result };
+    });
+  });
+}
+
 function search({ cwd, taskId, query = '', limit = 20 } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
@@ -411,18 +513,9 @@ function proposeContractChange({
         error.taskId = task.id;
         throw error;
       }
-      const event = store.appendEvent({
-        projectId,
-        taskId: task.id,
-        type: 'contract.change-proposed',
-        payload: {
-          proposal: diff,
-          sourceRef,
-          expectedContractRevision,
-          status: 'candidate',
-          owner,
-        },
-        idempotencyKey,
+      const { candidate, event } = store.createContractCandidate({
+        projectId, taskId: task.id, baseContractVersion: expectedContractRevision,
+        diff, sourceRef, idempotencyKey,
       });
       return {
         ok: true,
@@ -430,9 +523,19 @@ function proposeContractChange({
         taskId: task.id,
         status: 'candidate',
         contractRevision: task.contractVersion,
+        candidate,
         event,
       };
     });
+  });
+}
+
+function decideContractChange({ cwd, candidateId, decision, decidedBy = 'user', idempotencyKey } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(candidateId, 'candidateId');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => ({ ok: true, projectId: store.project.id,
+      ...store.decideContractCandidate({ projectId: store.project.id, candidateId, decision, decidedBy, idempotencyKey }) }));
   });
 }
 
@@ -441,8 +544,14 @@ const operations = Object.freeze({
   bootstrap,
   claim,
   checkpoint,
+  commit,
   search,
   proposeContractChange,
+  startTask,
+  useTask,
+  listTasks,
+  setTaskState,
+  decideContractChange,
 });
 
 export {
@@ -451,6 +560,12 @@ export {
   bootstrap,
   claim,
   checkpoint,
+  commit,
   search,
   proposeContractChange,
+  startTask,
+  useTask,
+  listTasks,
+  setTaskState,
+  decideContractChange,
 };

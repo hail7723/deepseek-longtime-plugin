@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 > The package was unified as `dsh-longtime-memory` in `0.1.2` and `0.2.2`. Entries before that use the historical package identity `@hail7723/dsh-project-memory`; they are kept for traceability.
 
+## [0.3.0-dev.1] - 2026-10-24
+
+### Added
+
+- Schema v2 migration backups, session/task bindings, contract-candidate decisions, tool-operation records, and bounded recovery rendering.
+- Offline migration, multi-session, canonical-workspace, recovery-budget, and candidate-decision tests.
+
+### Changed
+
+- Default model tools no longer expose revision, lease, or fencing fields. Legacy low-level tools are behind `compatibilityTools`.
+
+### Not yet verified
+
+- Real Desktop new-session, `/compact`, and provider-overflow behavior; no Desktop profile was modified and no paid model request was made.
+
 ## [0.2.2] - 2026-10-24
 
 ### Added

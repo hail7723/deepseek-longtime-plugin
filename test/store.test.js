@@ -27,7 +27,7 @@ test('openProjectStore persists marker identity and enables WAL', (t) => {
   assert.equal(first.project.rootPath, path.resolve(root));
   const marker = JSON.parse(readFileSync(first.markerPath, 'utf8'));
   assert.equal(marker.project_id, firstId);
-  assert.equal(marker.schema_version, 1);
+  assert.equal(marker.schema_version, 2);
   assert.equal('projectId' in marker, false);
   assert.equal(path.basename(first.databasePath), 'memory.sqlite');
   first.close();
@@ -273,7 +273,7 @@ test('commitCheckpoint atomically validates both revisions and fences the snapsh
   store.createTask({
     projectId,
     id: 'task-commit',
-    state: 'pending',
+    state: 'paused',
     contract: { command: 'node --test' },
   });
   const leaseA = store.claimTask({
@@ -288,7 +288,7 @@ test('commitCheckpoint atomically validates both revisions and fences the snapsh
     expectedTaskVersion: 1,
     expectedContractVersion: 1,
     lease: leaseA,
-    taskPatch: { state: 'verified' },
+    taskPatch: { state: 'completed' },
     evidence: [
       { id: 'commit-evidence-1', kind: 'test', payload: { command: 'node --test' } },
       { id: 'commit-evidence-2', kind: 'result', payload: { passed: true } },
@@ -415,7 +415,7 @@ test('checkpoint and recovery package preserve replay order and scope', (t) => {
     branch: 'main',
     workspace: 'workspace-a',
   });
-  assert.equal(recovery.schemaVersion, 1);
+  assert.equal(recovery.schemaVersion, 2);
   assert.equal(recovery.project.eventSeq, 3);
   assert.equal(recovery.tasks.length, 1);
   assert.deepEqual(recovery.events.map((event) => event.seq), [1, 2, 3]);
