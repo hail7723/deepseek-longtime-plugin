@@ -188,11 +188,11 @@ class ProjectMemoryRemoteService extends TypertRemoteService {
     return commitOperation({
       cwd,
       sessionId: requireSessionId(request),
-      progress: request.progress ?? '',
-      nextAction: request.next_action ?? request.nextAction ?? null,
-      blockers: request.blockers ?? [],
-      acceptanceUpdates: request.acceptance_updates ?? request.acceptanceUpdates ?? [],
-      evidenceRefs: request.evidence_refs ?? request.evidenceRefs ?? [],
+      progress: request.progress,
+      nextAction: request.next_action ?? request.nextAction,
+      blockers: request.blockers,
+      acceptanceUpdates: Object.hasOwn(request, 'acceptance_updates') ? request.acceptance_updates : request.acceptanceUpdates,
+      evidenceRefs: request.evidence_refs ?? request.evidenceRefs,
       state: request.state,
       idempotencyKey: request.idempotency_key ?? request.idempotencyKey,
     });
@@ -290,9 +290,13 @@ class ProjectMemoryRemoteService extends TypertRemoteService {
     const cwd = normalizedCwd(request);
     return searchOperation({
       cwd,
+      sessionId: request.session_id ?? request.sessionId,
       taskId: request.task_id ?? request.taskId,
-      query: request.query ?? '',
-      limit: request.limit ?? 20,
+      query: request.query,
+      mode: request.mode,
+      scope: request.scope,
+      includeDeferred: Object.hasOwn(request, 'include_deferred') ? request.include_deferred : request.includeDeferred,
+      limit: request.limit,
     });
   }
 

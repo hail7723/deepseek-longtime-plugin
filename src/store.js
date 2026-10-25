@@ -2,8 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { mergeAcceptanceUpdates } from './acceptance.js';
+import { configureSearchFunctions, detectSearchCapabilities, installSearchIndex } from './search-index.js';
+import { searchPage } from './search.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const TASK_STATES = new Set(['active', 'paused', 'blocked', 'completed', 'archived']);
 const TRANSITIONS = Object.freeze({
   active: new Set(['paused', 'blocked', 'completed', 'archived']),
@@ -136,6 +139,8 @@ function mapDeferredCommit(row) {
     kind: row.kind,
     payload: decode(row.payload_json),
     status: row.status,
+    branch: row.branch ?? null,
+    workspace: row.workspace ?? null,
     createdAt: row.created_at,
     flushedAt: row.flushed_at,
     reason: row.reason,
@@ -198,11 +203,27 @@ class ProjectMemoryStore {
       readOnly: options.readOnly ?? false,
     });
     this.closed = false;
-    this.db.exec('PRAGMA foreign_keys = ON');
-    this.db.exec(`PRAGMA busy_timeout = ${Number(options.timeout ?? 5000)}`);
-    if (!(options.readOnly ?? false)) {
-      this.db.exec('PRAGMA journal_mode = WAL');
-      this.#migrate();
+    try {
+      this.db.exec('PRAGMA foreign_keys = ON');
+      this.db.exec(`PRAGMA busy_timeout = ${Number(options.timeout ?? 5000)}`);
+      configureSearchFunctions(this.db);
+      this.searchCapabilities = detectSearchCapabilities(this.db);
+      const meta = this.db.prepare("SELECT name FROM sqlite_master WHERE name = 'schema_meta'").get();
+      const version = meta ? Number(this.db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get()?.value ?? 1) : null;
+      if (version > SCHEMA_VERSION) throw new StoreError('Database schema is newer than this plugin', 'SCHEMA_TOO_NEW', { version });
+      if (!(options.readOnly ?? false)) {
+        if (version !== null && version < SCHEMA_VERSION && databasePath !== ':memory:') {
+          // Snapshot committed WAL data consistently before schema changes.
+          let backup = `${databasePath}.v${version}-backup`;
+          if (fs.existsSync(backup)) backup += `.${randomUUID()}`;
+          this.db.prepare('VACUUM INTO ?').run(backup);
+          this.migrationBackup = backup;
+        }
+        this.db.exec('PRAGMA journal_mode = WAL');
+        this.#migrate();
+      }
+    } catch (error) {
+      this.close(); throw error;
     }
   }
 
@@ -242,21 +263,12 @@ class ProjectMemoryStore {
 
     const markerSchemaVersion = marker.schema_version ?? marker.schemaVersion;
     const markerProjectId = marker.project_id ?? marker.projectId;
-    if (![1, 2, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
+    if (![1, 2, 3, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
       throw new StoreError(`Invalid project marker at ${markerPath}`, 'INVALID_PROJECT_MARKER', { markerPath });
     }
     const databasePath = options.databasePath ?? path.join(stateDirectory, DEFAULT_DATABASE_FILE);
-    // An older database is never migrated in place without a same-directory
-    // recovery copy.  WAL sidecars can hold the most recent transactions.
-    if (markerSchemaVersion < SCHEMA_VERSION && fs.existsSync(databasePath)) {
-      const backup = `${databasePath}.v${markerSchemaVersion}-backup`;
-      if (!fs.existsSync(backup)) {
-        fs.copyFileSync(databasePath, backup);
-        for (const suffix of ['-wal', '-shm']) {
-          if (fs.existsSync(`${databasePath}${suffix}`)) fs.copyFileSync(`${databasePath}${suffix}`, `${backup}${suffix}`);
-        }
-      }
-    }
+    // The constructor backs up the actual database schema before migrating,
+    // including direct database-path callers and projects with a stale marker.
     const store = new ProjectMemoryStore(databasePath, options);
     const project = store.ensureProject({
       id: markerProjectId,
@@ -409,7 +421,7 @@ class ProjectMemoryStore {
               payload.sourceRef == null ? null : encode(payload.sourceRef), duplicate ? 'superseded' : 'pending',
               event.created_at, duplicate ? event.created_at : null, duplicate ? 'migration:duplicate' : null);
         }
-        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run('2');
       });
     }
     if (version < 3) {
@@ -434,7 +446,17 @@ class ProjectMemoryStore {
           ) STRICT;
           CREATE INDEX IF NOT EXISTS deferred_commits_task ON deferred_commits(project_id, task_id, status, created_at);
         `);
-        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run('3');
+      });
+    }
+    if (version < 4) {
+      this.#transaction(() => {
+        const columns = new Set(this.db.prepare('PRAGMA table_info(deferred_commits)').all().map(row => row.name));
+        // Unknown legacy origins must not be guessed from current task state.
+        if (!columns.has('branch')) this.db.exec('ALTER TABLE deferred_commits ADD COLUMN branch TEXT');
+        if (!columns.has('workspace')) this.db.exec('ALTER TABLE deferred_commits ADD COLUMN workspace TEXT');
+        installSearchIndex(this.db);
+        this.db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
       });
     }
   }
@@ -624,7 +646,7 @@ class ProjectMemoryStore {
       .run(nowIso(), sessionId, taskId);
   }
 
-  enqueueDeferredCommit({ projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, payload, id = randomUUID(), now = Date.now() }) {
+  enqueueDeferredCommit({ projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, payload, branch = null, workspace = null, id = randomUUID(), now = Date.now() }) {
     requireString(projectId, 'projectId');
     requireString(taskId, 'taskId');
     requireString(sessionId, 'sessionId');
@@ -637,9 +659,9 @@ class ProjectMemoryStore {
       const timestamp = nowIso();
       this.db.prepare(`INSERT INTO deferred_commits(
           id, project_id, task_id, session_id, base_task_version, base_contract_version,
-          kind, payload_json, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`)
-        .run(id, projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, encode(payload), timestamp);
+          kind, payload_json, status, created_at, branch, workspace
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`)
+        .run(id, projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, encode(payload), timestamp, branch, workspace);
       return mapDeferredCommit(this.db.prepare('SELECT * FROM deferred_commits WHERE id = ?').get(id));
     });
   }
@@ -1087,6 +1109,22 @@ class ProjectMemoryStore {
     `).get(...parameters));
   }
 
+  readAcceptanceUpdates({ projectId, taskId, branch, workspace }) {
+    const task = this.#requireTask(projectId, taskId);
+    const current = Array.isArray(task.data?.acceptanceUpdates) ? task.data.acceptanceUpdates : [];
+    // Older builds wrote [] on ordinary checkpoints (and on task.data). Read
+    // the newest non-empty observation in this workspace without rewriting DBs.
+    const row = this.db.prepare(`SELECT payload_json FROM checkpoints
+      WHERE project_id = ? AND task_id = ? AND branch = ? AND workspace = ?
+        AND json_type(payload_json, '$.acceptanceUpdates') = 'array'
+        AND json_array_length(payload_json, '$.acceptanceUpdates') > 0
+      ORDER BY event_seq DESC LIMIT 1`).get(projectId, taskId, branch, workspace);
+    // Legacy deferred flushes only wrote the checkpoint. Its observation must
+    // supersede an older task observation for the same criterion.
+    return row ? mergeAcceptanceUpdates(current, decode(row.payload_json).acceptanceUpdates)
+      : current.length ? current : null;
+  }
+
   exportRecoveryBundle(projectId, options = {}) {
     const project = this.getProject(projectId);
     if (!project) throw new StoreError('Project not found', 'NOT_FOUND', { projectId });
@@ -1138,39 +1176,23 @@ class ProjectMemoryStore {
     return this.createCheckpoint(options);
   }
 
-  search({ projectId, taskId, query = '', branch, workspace, limit = 100 }) {
-    requireString(projectId, 'projectId');
-    if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError('limit must be a positive safe integer');
-    const clauses = ['project_id = ?', 'instr(payload_json, ?) > 0'];
-    const parameters = [projectId, query];
-    if (taskId !== undefined) {
-      clauses.push('task_id = ?');
-      parameters.push(taskId);
+  searchPage(options) {
+    // Keep counts, queued shadowing and returned rows in one read snapshot.
+    if (this.db.isTransaction) return searchPage(this.db, options);
+    this.db.exec('BEGIN');
+    try {
+      const result = searchPage(this.db, options);
+      this.db.exec('COMMIT'); return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK'); throw error;
     }
-    if (branch !== undefined) {
-      clauses.push('branch = ?');
-      parameters.push(branch);
-    }
-    if (workspace !== undefined) {
-      clauses.push('workspace = ?');
-      parameters.push(workspace);
-    }
-    parameters.push(limit);
-    const where = clauses.join(' AND ');
-    const evidence = this.db.prepare(`
-      SELECT * FROM evidence WHERE ${where}
-      ORDER BY event_seq DESC, id LIMIT ?
-    `).all(...parameters).map(mapEvidence);
-    const checkpoints = this.db.prepare(`
-      SELECT * FROM checkpoints WHERE ${where}
-      ORDER BY event_seq DESC, id LIMIT ?
-    `).all(...parameters).map(row => {
-      const checkpoint = mapCheckpoint(row);
-      return { ...checkpoint, kind: 'checkpoint', summary: checkpoint.payload?.summary ?? '' };
-    });
-    return [...evidence, ...checkpoints]
-      .sort((left, right) => right.eventSeq - left.eventSeq || left.id.localeCompare(right.id))
-      .slice(0, limit);
+  }
+
+  search(options) {
+    // Retain the low-level array API; Agent and Remote use the same query
+    // implementation with a metadata envelope and explicitly resolved filters.
+    const scope = options.scope ?? (options.branch !== undefined && options.workspace !== undefined ? 'current' : options.taskId ? 'task' : 'current');
+    return this.searchPage({ ...options, scope }).results;
   }
 
   proposeContractChange({

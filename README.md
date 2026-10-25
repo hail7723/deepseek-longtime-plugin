@@ -19,7 +19,7 @@ Host side:
 - independent task and contract revisions with compare-and-swap conflict errors;
 - persistent session-to-task bindings; one unfinished task may be selected automatically, while multiple tasks always require explicit selection;
 - agent-scoped `memory_start_task`, `memory_use_task`, `memory_commit`, `memory_search`, and `memory_propose_contract_change` tools; revisions, leases, and fences remain Host internals;
-- schema-v1 to schema-v2 migration with a same-directory `memory.sqlite.v1-backup` recovery copy;
+- schema-v1/v2/v3 to schema-v4 migration with a consistent same-directory recovery backup before upgrades;
 - contract-candidate acceptance/rejection lifecycle and a correlated pending/succeeded/failed/unknown tool-operation record;
 - required runtime-context recovery on new sessions, resumed sessions, normal compaction, and overflow retries;
 - branch/workspace evidence isolation and pending tool-operation records.
@@ -30,7 +30,7 @@ Visual side (`0.2.x` compatibility panel):
 - overview of project id, task and contract revisions, event sequence, objective, acceptance criteria, next action, and pending operations;
 - task claim and checkpoint forms with revision and lease fencing feedback;
 - contract candidate proposals that stay pending until confirmed;
-- history search over scoped evidence, checkpoint summaries, and recent events;
+- FTS5/trigram search over scoped evidence, checkpoint/acceptance text, task history and labelled queued drafts, with explicit any/all/phrase modes and current/task/project scopes;
 - styling from Harness theme tokens only, with light and dark layouts.
 
 The panel is local-only: the browser receives JSON through the package-private `projectMemory` Remote service and never opens SQLite directly.
@@ -96,13 +96,15 @@ Use Plugin Manager to enable or disable `project-memory`. Disabling unloads its 
 & $dsh021 plugin --profile <profile> remove dsh-longtime-memory
 ```
 
-### Restore a v1 database for v0.2.2
+### Database migration and rollback
 
-Before opening a v1 project, v0.3 creates `memory.sqlite.v1-backup` next to the database (and copies `-wal`/`-shm` when present). To return to v0.2.2, first disable the plugin and close every Harness process using that project. Preserve the current v2 files under a different name, restore the `*.v1-backup` database and any matching sidecars, then set `project.json` back to `"schema_version": 1`. Do not copy database files while SQLite is open.
+Schema v4 adds a rebuildable search index and origin metadata for new queued drafts. Before upgrading a v1/v2/v3 database, the plugin creates `memory.sqlite.v<V>-backup` next to it using `VACUUM INTO`, including committed WAL data in a self-contained snapshot. Existing backups are retained, with a UUID suffix for a fresh retry backup. To roll back, disable the plugin and close every Harness process using that project, preserve the current database/sidecars and marker, restore the snapshot generated for that upgrade, and restore the marker's original schema version. Older backups made by previous builds may require their matching WAL sidecars. Never replace files while SQLite is open.
+
+See [P1 retrieval contract and migration details](docs/p1-search-reliability.md) for scope rules, queued versus confirmed results, the 16 KB budget, and query examples. Historical `passed` results have `freshness: "unknown"`; search does not revalidate evidence.
 
 ## Verification
 
-- `npm test` runs 30 offline tests, including real Harness Client/Host Gateway integration, a v1 migration sample, persistent task bindings, and bounded recovery rendering.
+- `npm test` covers real Harness Agent output and Client/Host Gateway integration, schema migrations/backups, persistent task bindings, P0 reliability, P1 retrieval, and bounded recovery rendering. All test databases use `os.tmpdir()`.
 - The previous isolated-browser evidence applies only to the v0.2 compatibility panel. Real Desktop new-session, `/compact`, and provider-overflow validation remain outstanding for v0.3.
 - Startup regressions from the withdrawn `0.2.0` and `0.2.1` builds are documented in `docs/desktop-boot-incident.md` and guarded by tests.
 

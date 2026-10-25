@@ -200,6 +200,28 @@ test('session-bound task flow crosses the gateway with explicit session ids', { 
   assert.equal(saved.value.ok, true, JSON.stringify(saved));
   assert.equal(saved.value.synced, true);
 
+  // P1: mode, scope and deferred visibility survive the real wire path.
+  const selectedSearch = await api.search({ cwd: directory, session_id: 'panel-session-a', query: 'checkpoint first', mode: 'all', scope: 'current' });
+  assert.equal(selectedSearch.value.ok, true, JSON.stringify(selectedSearch));
+  assert.equal(selectedSearch.value.filters.taskId, first.value.task.id);
+  assert.equal(selectedSearch.value.mode, 'all');
+  assert.ok(selectedSearch.value.results.some(row => row.source === 'checkpoint'));
+  const peerSearch = await api.search({ cwd: directory, session_id: 'panel-session-b', query: 'checkpoint first', mode: 'all' });
+  assert.deepEqual(peerSearch.value.results, []);
+  assert.ok(peerSearch.value.diagnostics.scopeFilteredMatches > 0);
+  const projectSearch = await api.search({ cwd: directory, session_id: 'panel-session-b', query: 'checkpoint first', mode: 'all', scope: 'project' });
+  assert.equal(projectSearch.value.filters.taskId, null);
+  assert.ok(projectSearch.value.results.some(row => row.taskId === first.value.task.id));
+  await api.useTask({ cwd: directory, session_id: 'panel-session-c', task_id: first.value.task.id });
+  const draft = await api.commit({ cwd: directory, session_id: 'panel-session-c', progress: 'gateway queued-only needle' });
+  assert.equal(draft.value.synced, false);
+  const queuedSearch = await api.search({ cwd: directory, session_id: 'panel-session-a', query: 'queued-only', mode: 'phrase' });
+  assert.equal(queuedSearch.value.results[0].visibility, 'queued');
+  assert.equal(queuedSearch.value.results[0].confirmed, false);
+  const withoutDrafts = await api.search({ cwd: directory, session_id: 'panel-session-a', query: 'queued-only', mode: 'phrase', include_deferred: false });
+  assert.deepEqual(withoutDrafts.value.results, []);
+  assert.equal(withoutDrafts.value.diagnostics.queuedMatchCount, 1);
+
   // Completing one task invalidates only its own binding.
   const done = await api.setTaskState({ cwd: directory, task_id: readme.value.task.id, state: 'completed' });
   assert.equal(done.value.ok, true, JSON.stringify(done));

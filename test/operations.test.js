@@ -154,7 +154,7 @@ test('task CAS and fencing conflicts are returned with structured details', (t) 
   }));
   assert.equal(staleFence.ok, false);
   assert.equal(staleFence.error.code, 'LEASE_CONFLICT');
-  assert.equal(staleFence.error.actualFence, second.leaseToken.fence);
+  assert.equal(Object.hasOwn(staleFence.error, 'actualFence'), false, 'fencing details must stay internal');
 
   const committed = checkpoint({
     cwd: root,

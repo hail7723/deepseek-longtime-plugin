@@ -49,7 +49,8 @@ test('strict-field commit against a live foreign lease fails readably', async (t
   assert.ok(typeof b.error.canRetryAt === 'string' && !Number.isNaN(Date.parse(b.error.canRetryAt)), 'canRetryAt must be an ISO timestamp');
   assert.equal(b.error.heldBy, 'other-session');
   assert.equal(b.error.owner, undefined, 'owner/fence stay diagnostic-only in the commit error');
-  assert.deepEqual(b.error.requested, { state: undefined, nextAction: 'take over', blockers: ['lease'] });
+  assert.deepEqual(b.error.requested, { progress: 'from b', next_action: 'take over', blockers: ['lease'] });
+  assert.deepEqual(JSON.parse(JSON.stringify(b)), b, 'conflict must survive JSON without omission');
   const status = leaseStatus({ cwd: root, taskId: started.task.id, sessionId: 'session-b' });
   assert.equal(status.ok, true);
   assert.equal(status.heldBy, 'other-session');
@@ -200,7 +201,7 @@ test('v2 databases upgrade to the deferred_commits schema with a backup', (t) =>
   store.enqueueDeferredCommit({ projectId: 'v2-project', taskId: 'v2-task', sessionId: 's', baseTaskVersion: 1, baseContractVersion: 1, kind: 'append', payload: {} });
   store.close();
   const marker = JSON.parse(fs.readFileSync(path.join(state, 'project.json'), 'utf8'));
-  assert.equal(marker.schema_version, 3);
+  assert.equal(marker.schema_version, 4);
 });
 
 function openRow(root, sql) {

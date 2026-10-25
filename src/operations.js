@@ -3,6 +3,9 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { openProjectStore } from './store.js';
+import { publicJson } from './public-json.js';
+import { validateAcceptanceUpdates, mergeAcceptanceUpdates } from './acceptance.js';
+import { parseSearchQuery } from './search.js';
 
 const MARKER_DIRECTORY = '.deepseek-memory';
 const MARKER_FILE = 'project.json';
@@ -109,9 +112,6 @@ function operationError(error) {
     'expectedVersion',
     'actualVersion',
     'versionKind',
-    'actualFence',
-    'owner',
-    'expiresAt',
     'markerPath',
   ]) {
     const value = error?.[key];
@@ -126,7 +126,8 @@ function operationError(error) {
     if (value !== undefined && value !== null) result[key] = value;
   }
   if (error?.requested !== undefined) result.requested = error.requested;
-  return { ok: false, error: result };
+  if (result.code === 'LEASE_CONFLICT') result.message = 'Task lease is unavailable or the write token is stale; retry after checking lease status';
+  return publicJson({ ok: false, error: result });
 }
 
 function execute(operation) {
@@ -262,6 +263,7 @@ function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0,
         project: store.getProject(projectId),
         tasks,
         task,
+        acceptanceUpdates: task === null ? null : store.readAcceptanceUpdates({ projectId, taskId: task.id, branch: facts.branch, workspace: facts.workspaceId }),
         selectionRequired: resolution.selectionRequired,
         taskCandidates: resolution.candidates ?? [],
         bindingSource: resolution.source,
@@ -501,7 +503,9 @@ function leaseError(task, requested, status) {
 }
 
 function replayDeferredItem(store, { projectId, taskId, item, owner, lease, facts, sessionId }) {
+  facts = { ...facts, branch: item.branch ?? facts.branch, workspaceId: item.workspace ?? facts.workspaceId };
   const latest = store.getTask(projectId, taskId);
+  validateAcceptanceUpdates(item.payload.acceptanceUpdates);
   if (item.baseContractVersion !== latest.contractVersion && (item.payload.acceptanceUpdates?.length)) {
     const error = new Error('Deferred acceptance observation is based on an older contract revision');
     error.reason = `contract revision moved from ${item.baseContractVersion} to ${latest.contractVersion} while queued`;
@@ -513,13 +517,15 @@ function replayDeferredItem(store, { projectId, taskId, item, owner, lease, fact
     expectedTaskVersion: latest.taskVersion,
     expectedContractVersion: latest.contractVersion,
     lease,
-    taskPatch: {},
+    taskPatch: item.payload.acceptanceUpdates?.length ? { data: { ...latest.data,
+      acceptanceUpdates: mergeAcceptanceUpdates(store.readAcceptanceUpdates({ projectId, taskId, branch: facts.branch, workspace: facts.workspaceId }), item.payload.acceptanceUpdates),
+    } } : {},
     evidence: (item.payload.evidenceRefs ?? []).map(ref => ({ kind: 'reference', payload: { ref, deferredFrom: item.sessionId } })),
     checkpointPayload: {
       summary: String(item.payload.progress ?? ''),
       nextAction: null,
       blockers: [],
-      acceptanceUpdates: item.payload.acceptanceUpdates ?? [],
+      ...(item.payload.acceptanceUpdates === undefined ? {} : { acceptanceUpdates: item.payload.acceptanceUpdates }),
       evidenceRefs: item.payload.evidenceRefs ?? [],
       sessionId: item.sessionId,
       deferredFlush: true,
@@ -536,10 +542,12 @@ function replayDeferredItem(store, { projectId, taskId, item, owner, lease, fact
 // tokens.  Strict fields (state, next action, blockers) are rejected readably
 // while another session holds the lease; provably independent appends defer
 // into a durable queue that the next lease holder flushes at most once.
-function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [], acceptanceUpdates = [], evidenceRefs = [], state, idempotencyKey, now = Date.now() } = {}) {
+function commit(options = {}) {
+  const { cwd, sessionId, progress = '', nextAction = null, blockers = [], acceptanceUpdates, evidenceRefs = [], state, idempotencyKey } = options;
   return executeAsync(async () => {
     const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId');
-    if (!Array.isArray(blockers) || !Array.isArray(acceptanceUpdates) || !Array.isArray(evidenceRefs)) throw new TypeError('commit lists must be arrays');
+    if (!Array.isArray(blockers) || !Array.isArray(evidenceRefs)) throw new TypeError('commit lists must be arrays');
+    validateAcceptanceUpdates(acceptanceUpdates);
     const projectRoot = requireProjectRoot(currentDirectory);
     const owner = `project-memory:${sessionId}`;
     return withStoreAsync(projectRoot, async store => {
@@ -552,18 +560,24 @@ function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [
         throw error;
       }
       const task = resolution.task;
-      const requested = { state, nextAction, blockers };
+      const requested = Object.fromEntries(['progress', 'nextAction', 'blockers', 'acceptanceUpdates', 'evidenceRefs', 'state']
+        .filter(key => options[key] !== undefined)
+        .map(key => [{ nextAction: 'next_action', acceptanceUpdates: 'acceptance_updates', evidenceRefs: 'evidence_refs' }[key] ?? key, options[key]]));
       const hasStrictFields = state !== undefined || nextAction !== null || blockers.length > 0;
 
       const attempt = () => {
         const lease = store.acquireLease({ projectId, taskId: task.id, owner, ttlMs: COMMIT_LEASE_TTL_MS });
         const latest = store.getTask(projectId, task.id);
-        const data = { ...latest.data, blockers, acceptanceUpdates, nextAction };
+        const data = { ...latest.data, blockers, nextAction,
+          ...(acceptanceUpdates?.length ? { acceptanceUpdates: mergeAcceptanceUpdates(
+            store.readAcceptanceUpdates({ projectId, taskId: task.id, branch: facts.branch, workspace: facts.workspaceId }), acceptanceUpdates) } : {}),
+        };
         const result = store.commitCheckpoint({
           projectId, taskId: latest.id, expectedTaskVersion: latest.taskVersion, expectedContractVersion: latest.contractVersion,
           lease, taskPatch: { ...(state ? { state } : {}), data },
           evidence: evidenceRefs.map(ref => ({ kind: 'reference', payload: { ref } })),
-          checkpointPayload: { summary: String(progress), nextAction, blockers, acceptanceUpdates, evidenceRefs, sessionId },
+          checkpointPayload: { summary: String(progress), nextAction, blockers,
+            ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }), evidenceRefs, sessionId },
           branch: facts.branch, workspace: facts.workspaceId, idempotencyKey: idempotencyKey ?? `commit:${sessionId}:${latest.id}:${latest.taskVersion}`,
         });
         return { result, lease };
@@ -594,14 +608,16 @@ function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [
           throw leaseError(task, requested, store.readLeaseStatus({ projectId, taskId: task.id, owner, now: Date.now() }));
         }
         const existing = store.listDeferredCommits({ projectId, taskId: task.id, sessionId, statuses: ['queued'] })
-          .find(item => item.payload.progress === String(progress)
+          .find(item => item.branch === facts.branch && item.workspace === facts.workspaceId
+            && item.payload.progress === String(progress)
             && JSON.stringify(item.payload.evidenceRefs ?? []) === JSON.stringify(evidenceRefs)
-            && JSON.stringify(item.payload.acceptanceUpdates ?? []) === JSON.stringify(acceptanceUpdates));
+            && JSON.stringify(item.payload.acceptanceUpdates) === JSON.stringify(acceptanceUpdates));
         const item = existing ?? store.enqueueDeferredCommit({
           projectId, taskId: task.id, sessionId,
           baseTaskVersion: task.taskVersion, baseContractVersion: task.contractVersion,
           kind: 'append',
-          payload: { progress: String(progress), acceptanceUpdates, evidenceRefs },
+          branch: facts.branch, workspace: facts.workspaceId,
+          payload: { progress: String(progress), ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }), evidenceRefs },
         });
         return {
           ok: true, projectId, taskId: task.id, synced: false,
@@ -710,28 +726,27 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function search({ cwd, taskId, query = '', limit = 20 } = {}) {
+function search({ cwd, sessionId, taskId, query, mode = 'any', scope = 'current', includeDeferred = true, limit = 20 } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
-    if (typeof query !== 'string') throw new TypeError('query must be a string');
-    requirePositiveInteger(limit, 'limit');
+    parseSearchQuery({ query, mode, scope, includeDeferred, limit });
     const projectRoot = requireProjectRoot(currentDirectory);
     return withStore(projectRoot, (store) => {
       const projectId = store.project.id;
-      if (taskId !== undefined && taskId !== null) selectTask(store, projectId, taskId);
       const facts = workspaceFacts(projectRoot, currentDirectory);
-      return {
-        ok: true,
-        projectId,
-        results: store.search({
-          projectId,
-          ...(taskId === undefined || taskId === null ? {} : { taskId }),
-          query,
-          branch: facts.branch,
-          workspace: facts.workspaceId,
-          limit,
-        }),
-      };
+      let selectedTaskId = taskId;
+      if (scope !== 'project') {
+        const resolution = resolveTask(store, projectId, { taskId, sessionId, workspaceId: facts.workspaceId });
+        if (!resolution.task) {
+          const error = new Error('Select a task for current/task search, or explicitly request scope:project');
+          error.code = 'TASK_SELECTION_REQUIRED'; throw error;
+        }
+        selectedTaskId = resolution.task.id;
+      } else if (taskId !== undefined && taskId !== null) selectTask(store, projectId, taskId);
+      return store.searchPage({ projectId, taskId: selectedTaskId,
+        query, mode, scope, includeDeferred, limit,
+        ...(scope === 'current' ? { branch: facts.branch, workspace: facts.workspaceId } : {}),
+      });
     });
   });
 }

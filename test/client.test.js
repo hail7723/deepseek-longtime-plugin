@@ -104,6 +104,48 @@ test('Remote mount rejection stays inside the memory panel instead of rejecting 
   await dispose();
 });
 
+test('search feedback distinguishes scope, zero matches and queued unconfirmed results', async t => {
+  const definition = await loadClientFactory();
+  t.after(() => { delete globalThis.window; });
+  let index = 0;
+  const states = ['history', 'D:/projects/search', 'session-search', { initialized: true, task: { id: 'task-search', state: 'active' } }, '', null,
+    { taskId: '' }, { progress: '', nextAction: '', blockers: '', evidence: '' }, { objective: '', criteria: '', constraints: '' },
+    { query: 'needle', limit: '20' }, [], { sourceRef: '', diff: '' }, null, false, null, []];
+  const React = {
+    Fragment: 'Fragment', useEffect() {}, useMemo(fn) { return fn(); },
+    useState(initial) { const i = index++; if (i >= states.length) states[i] = initial; return [states[i], next => { states[i] = typeof next === 'function' ? next(states[i]) : next; }]; },
+    createElement(type, props, ...children) { return typeof type === 'function' ? type({ ...props, children }) : { type, props: { ...props, children } }; },
+  };
+  const calls = [];
+  let response = { ok: true, scope: 'current', mode: 'any', queuedDeferredCount: 1, results: [], diagnostics: { scopeFilteredMatches: 1 } };
+  const registrations = [];
+  const plugin = definition.factory(() => React);
+  const dispose = await plugin.apply({
+    remote: { async $mount() { return async () => {}; } },
+    get(name) { return name === 'remote.projectMemory' ? { async search(request) { calls.push(request); return { ok: true, value: response }; } } : {}; },
+    slots: { inject(name, register) { register(); return () => {}; }, register(options, component) { registrations.push({ options, component }); return () => {}; } },
+  });
+  try {
+    const panel = registrations.find(item => item.options.key === 'project-memory').component;
+    const render = () => { index = 0; return panel({}); };
+    function buttons(node, out = []) {
+      if (Array.isArray(node)) { for (const item of node) buttons(item, out); }
+      else if (node?.props) { if (node.type === 'button') out.push(node.props); buttons(node.props.children, out); }
+      return out;
+    }
+    const findSearch = () => buttons(render()).find(props => props.children?.includes('搜索历史'));
+    await findSearch().onClick();
+    assert.equal(calls[0].session_id, 'session-search');
+    assert.match(states[5].message, /未命中不代表未写入/);
+    assert.match(states[5].message, /当前工作区/);
+    response = { ...response, results: [{ id: 'q', source: 'deferred', visibility: 'queued', confirmed: false, synced: false, snippet: 'needle', freshness: 'unknown', createdAt: '2026-10-25T00:00:00.000Z' }] };
+    await findSearch().onClick();
+    const text = JSON.stringify(render());
+    assert.match(text, /待同步.*未确认/);
+    assert.match(text, /时效未核验/);
+  } finally { await dispose(); }
+});
+
 test('ambiguous workspaces render an explicit picker and a pick loads that project', async (t) => {
   const definition = await loadClientFactory();
   t.after(() => { delete globalThis.window; });

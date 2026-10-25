@@ -321,7 +321,14 @@ window.__ModuleLoader__.load({
       }
       async function doSearch() {
         setBusy('search'); setFeedback(null);
-        try { const out = await api('search', { cwd, task_id: taskId || undefined, query: search.query, limit: Number(search.limit) || 20 }); if (out && out.ok === false) throw out.error || out; setResults(asArray(out && (out.results || out.items || out))); setFeedback({ type: 'success', title: '搜索完成', message: `找到 ${asArray(out && (out.results || out.items || out)).length} 条结果` }); }
+        try {
+          const out = await api('search', { cwd, session_id: sessionId || undefined, task_id: taskId || undefined, query: search.query, limit: Number(search.limit) || 20 });
+          if (out && out.ok === false) throw out.error || out;
+          const found = asArray(out && (out.results || out.items || out));
+          const scopeLabel = { current: '当前工作区（所选任务）', task: '指定任务的全部工作区', project: '整个项目' }[out && out.scope] || '当前工作区';
+          setResults(found);
+          setFeedback({ type: 'success', title: '搜索完成', message: `找到 ${found.length} 条历史结果；范围：${scopeLabel}。${found.length ? '' : '未命中不代表未写入，请检查作用域、查询方式或待同步草稿。'}${out && out.queuedDeferredCount ? ` 范围内有 ${out.queuedDeferredCount} 条待同步草稿，尚未确认。` : ''}${out && out.budget && out.budget.truncated ? ' 部分结果受数量或字节预算限制，请缩小查询。' : ''}` });
+        }
         catch (error) { setFeedback(errorInfo(error)); } finally { setBusy(''); }
       }
       async function doPropose() {
@@ -391,8 +398,9 @@ window.__ModuleLoader__.load({
           button(busy === 'search' ? '搜索中…' : TEXT.search, doSearch, true, Boolean(busy || !search.query.trim())),
         ),
         section('搜索结果', rows(results, (item, i) => {
-          const title = first(item.type, first(item.title, `结果 ${i + 1}`));
-          const detail = first(item.summary, first(item.text, json(item)));
+          const visibility = item.visibility === 'queued' ? '待同步 · 未确认' : item.visibility === 'confirmed' ? '已同步历史' : '';
+          const title = `${first(item.type, first(item.title, first(item.source, `结果 ${i + 1}`)))}${visibility ? ` · ${visibility}` : ''}${item.freshness === 'unknown' ? ' · 时效未核验' : ''}`;
+          const detail = first(item.snippet, first(item.summary, first(item.text, json(item))));
           const marker = first(item.event_seq || item.eventSeq, first(item.created_at || item.createdAt, '记录'));
           return h('li', { className: 'pm-row', key: item.id || item.event_seq || i },
             h('div', null, h('div', { className: 'pm-row-title' }, title), h('div', { className: 'pm-row-detail' }, detail)),

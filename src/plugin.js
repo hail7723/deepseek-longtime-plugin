@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { openProjectStore } from './store.js';
+import { publicJson, publicCommitResult } from './public-json.js';
 import {
   bootstrap as bootstrapOperation,
   checkpoint as checkpointOperation,
@@ -33,10 +34,9 @@ function normalizeError(error) {
     ok: false,
     error: {
       code: typeof error?.code === 'string' ? error.code : 'PROJECT_MEMORY_ERROR',
-      message: error instanceof Error ? error.message : String(error),
+      message: error?.code === 'LEASE_CONFLICT' ? 'Task lease is unavailable or the write token is stale' : error instanceof Error ? error.message : String(error),
       ...Number.isSafeInteger(error?.expectedVersion) ? { expectedVersion: error.expectedVersion } : {},
       ...Number.isSafeInteger(error?.actualVersion) ? { actualVersion: error.actualVersion } : {},
-      ...Number.isSafeInteger(error?.actualFence) ? { actualFence: error.actualFence } : {},
     },
   };
 }
@@ -93,7 +93,7 @@ function renderRecoveryPackage(snapshot) {
     recoveryLine('Revisions / workspace / branch / code', `${task.taskVersion}/${task.contractVersion}; ${snapshot.workspaceId}; ${snapshot.branch}; ${snapshot.codeRevision ?? 'unknown'}`),
     recoveryLine('Objective', task.contract?.objective ?? task.title, 1000),
     recoveryLine('Confirmed constraints', (task.contract?.constraints ?? []).join(' · ') || 'none', 850),
-    recoveryLine('Acceptance status', JSON.stringify(checkpoint.acceptanceUpdates ?? task.contract?.acceptanceCriteria ?? []), 850),
+    recoveryLine('Acceptance status', JSON.stringify(snapshot.acceptanceUpdates ?? task.data?.acceptanceUpdates ?? checkpoint.acceptanceUpdates ?? task.contract?.acceptanceCriteria ?? []), 850),
     recoveryLine('Current state', checkpoint.summary ?? task.data?.progress ?? 'No confirmed checkpoint yet', 900),
     recoveryLine('Pending or unknown external operations', pending.map(item => `${item.toolName} (${item.status})`).join(', ') || 'none', 500),
     recoveryLine('Next action', checkpoint.nextAction ?? task.data?.nextAction ?? 'Review current work and commit evidence-backed progress.', 850),
@@ -265,11 +265,11 @@ class AgentMemoryBinding {
     const result = await commitOperation({
       cwd: this.cwd,
       sessionId: String(this.agent.id),
-      progress: args.progress ?? '',
-      nextAction: args.next_action ?? null,
-      blockers: args.blockers ?? [],
-      acceptanceUpdates: args.acceptance_updates ?? [],
-      evidenceRefs: args.evidence_refs ?? [],
+      progress: args.progress,
+      nextAction: args.next_action,
+      blockers: args.blockers,
+      acceptanceUpdates: args.acceptance_updates,
+      evidenceRefs: args.evidence_refs,
       state: args.state,
       idempotencyKey: args.idempotency_key,
     });
@@ -454,25 +454,14 @@ class AgentMemoryBinding {
   search(args) {
     return searchOperation({
       cwd: this.cwd,
-      taskId: args.task_id ?? this.taskId ?? undefined,
-      query: args.query ?? '',
-      limit: args.limit ?? 20,
+      sessionId: String(this.agent.id),
+      taskId: args.task_id,
+      query: args.query,
+      mode: args.mode,
+      scope: args.scope,
+      includeDeferred: args.include_deferred,
+      limit: args.limit,
     });
-
-    /* Legacy inline implementation retained below for source compatibility; unreachable. */
-    this.requireBound();
-    const facts = this.facts();
-    return {
-      ok: true,
-      results: this.store.search({
-        projectId: this.projectId,
-        taskId: args.task_id ?? this.taskId ?? undefined,
-        query: args.query ?? '',
-        branch: facts.branch,
-        workspace: facts.workspaceId,
-        limit: args.limit ?? 20,
-      }),
-    };
   }
 
   proposeContractChange(args) {
@@ -577,7 +566,7 @@ const definitions = [
   { name: 'memory_lease_status', method: 'leaseStatus', description: 'Read the save state of the selected task: who holds the write lease, how long until a retry is possible. No fence or raw timestamps in the normal output.', parameters: objectSchema({ task_id: { type: 'string' } }) },
   { name: 'memory_deferred_list', method: 'deferredCommits', description: 'List deferred (unsynced) drafts for the selected task, including queued/conflict/flushed status.', parameters: objectSchema({ task_id: { type: 'string' } }) },
   { name: 'memory_deferred_discard', method: 'discardDeferredCommit', description: 'Discard one of this session\'s queued drafts so it is never flushed.', parameters: objectSchema({ id: { type: 'string' } }, ['id']) },
-  { name: 'memory_search', method: 'search', description: 'Search bounded local history and evidence on demand.', parameters: objectSchema({ query: { type: 'string' }, task_id: { type: 'string' }, limit: { type: 'integer' } }, ['query']) },
+  { name: 'memory_search', method: 'search', description: 'Search historical checkpoint, evidence, task history and queued drafts. current keeps the selected task and current branch/workspace; task searches one task across workspaces; project must be explicit. any matches any normalized term, all requires all terms, phrase requires their literal order. Queued results are unconfirmed; freshness is unknown.', parameters: objectSchema({ query: { type: 'string', minLength: 1 }, mode: { type: 'string', enum: ['any', 'all', 'phrase'] }, scope: { type: 'string', enum: ['current', 'task', 'project'] }, task_id: { type: 'string' }, include_deferred: { type: 'boolean' }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['query']) },
   { name: 'memory_propose_contract_change', method: 'propose', description: 'Propose a contract change for later user acceptance or rejection.', parameters: objectSchema({ task_id: { type: 'string' }, diff: { type: 'object', additionalProperties: true }, source_ref: { type: 'string' }, idempotency_key: { type: 'string' } }, ['diff', 'source_ref']) },
 ];
 const adminDefinitions = [
@@ -611,10 +600,11 @@ function registerAgent(agent, cwd, logger, options = { compatibilityTools: true 
       output: outputDefinition(),
       async execute(args) {
         try {
-          return await binding[definition.method](args ?? {});
+          const result = publicJson(await binding[definition.method](args ?? {}));
+          return publicJson(definition.name === 'memory_commit' ? publicCommitResult(result) : result);
         } catch (error) {
           logger.warn(`${definition.name}: ${error instanceof Error ? error.message : String(error)}`);
-          return normalizeError(error);
+          return publicJson(normalizeError(error));
         }
       },
       isConcurrencySafe: () => ['memory_search', 'memory_list_tasks', 'memory_lease_status', 'memory_deferred_list'].includes(definition.name),
