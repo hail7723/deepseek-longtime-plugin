@@ -601,7 +601,10 @@ export function apply(ctx) {
     const agentDisposers = new Map();
     ctx.on('agent/created', async ({ agent, signal }) => {
       const cwd = await ctx.workingDirectory.ensure(agent, signal);
-      const dispose = registerAgent(agent, cwd, logger, ctx.config ?? {});
+      // `config` is not a guaranteed injectable Host service in Harness
+      // 0.2.1-rc.3.  Reading it here prevents session creation entirely.
+      // Keep compatibility tools opt-in for direct/test registration only.
+      const dispose = registerAgent(agent, cwd, logger, {});
       agentDisposers.set(agent, dispose);
     });
     ctx.on('agent/disposed', ({ agent }) => {

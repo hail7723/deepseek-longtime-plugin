@@ -19,6 +19,12 @@ All notable changes to this project will be documented in this file.
 
 - Real Desktop new-session, `/compact`, and provider-overflow behavior; no Desktop profile was modified and no paid model request was made.
 
+## [0.3.0-dev.2] - 2026-10-25
+
+### Fixed
+
+- Do not read the non-injected Harness `ctx.config` property during `agent/created`; this previously prevented real session creation with `cannot get property "config" without inject`.
+
 ## [0.2.2] - 2026-10-24
 
 ### Added
