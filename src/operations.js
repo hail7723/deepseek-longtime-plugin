@@ -7,6 +7,13 @@ import { openProjectStore } from './store.js';
 const MARKER_DIRECTORY = '.deepseek-memory';
 const MARKER_FILE = 'project.json';
 const DEFAULT_EVENT_LIMIT = 100;
+// A committing session holds a short, implicitly renewable lease: writes are
+// single transactions, and a crashed holder must not block a resumed session
+// for the old five minutes.
+const COMMIT_LEASE_TTL_MS = 60000;
+// When the foreign lease is about to expire anyway, one backed-off retry is
+// cheaper than failing the write and queueing it.
+const RETRY_WINDOW_SECONDS = 2;
 
 function requireString(value, name) {
   if (typeof value !== 'string' || value.length === 0) {
@@ -112,6 +119,13 @@ function operationError(error) {
       result[key] = value;
     }
   }
+  // Readable lease information is copied for UI rendering; owner/fence stay in
+  // diagnostics only.
+  for (const key of ['heldBy', 'retryAfterSeconds', 'canRetryAt']) {
+    const value = error?.[key];
+    if (value !== undefined && value !== null) result[key] = value;
+  }
+  if (error?.requested !== undefined) result.requested = error.requested;
   return { ok: false, error: result };
 }
 
@@ -123,10 +137,31 @@ function execute(operation) {
   }
 }
 
+// The backed-off lease retry makes the operation async; errors must still
+// resolve to the readable `{ ok: false, error }` shape.
+async function executeAsync(operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    return operationError(error);
+  }
+}
+
 function withStore(projectRoot, operation) {
   const store = openProjectStore(projectRoot);
   try {
     return operation(store);
+  } finally {
+    store.close();
+  }
+}
+
+// Backed-off retry sleeps with the store open; the connection is closed only
+// after the awaited operation settles.
+async function withStoreAsync(projectRoot, operation) {
+  const store = openProjectStore(projectRoot);
+  try {
+    return await operation(store);
   } finally {
     store.close();
   }
@@ -144,6 +179,14 @@ function requireProjectRoot(cwd) {
 
 function openTasks(store, projectId) {
   return store.listTasks(projectId).filter(task => !['completed', 'archived'].includes(task.state));
+}
+
+function deferredCountsOf(items) {
+  const counts = { queued: 0, flushed: 0, conflict: 0, discarded: 0 };
+  for (const item of items) {
+    if (counts[item.status] !== undefined) counts[item.status] += 1;
+  }
+  return counts;
 }
 
 function selectTask(store, projectId, taskId) {
@@ -166,8 +209,18 @@ function selectTask(store, projectId, taskId) {
 function resolveTask(store, projectId, { taskId, sessionId, workspaceId }) {
   if (taskId !== undefined && taskId !== null) return { task: selectTask(store, projectId, taskId), source: 'explicit', selectionRequired: false };
   if (sessionId) {
-    const binding = store.touchSessionBinding({ sessionId, projectId, workspaceId });
-    if (binding) return { task: store.getTask(projectId, binding.taskId), source: binding.bindingSource, selectionRequired: false };
+    const binding = store.getSessionBinding({ sessionId, projectId, workspaceId });
+    if (binding) {
+      const bound = store.getTask(projectId, binding.taskId);
+      if (bound && !['completed', 'archived'].includes(bound.state)) {
+        store.touchSessionBinding({ sessionId, projectId, workspaceId });
+        return { task: bound, source: binding.bindingSource, selectionRequired: false };
+      }
+      // The bound task reached a terminal state.  This session must choose
+      // again explicitly — it never silently adopts the remaining open task.
+      const stale = openTasks(store, projectId);
+      return { task: null, source: 'invalidated-binding', selectionRequired: stale.length > 0, candidates: stale };
+    }
   }
   const candidates = openTasks(store, projectId);
   if (candidates.length === 1) {
@@ -178,7 +231,7 @@ function resolveTask(store, projectId, { taskId, sessionId, workspaceId }) {
   return { task: null, source: null, selectionRequired: candidates.length > 1, candidates };
 }
 
-function readProjectSnapshot({ cwd, taskId, sessionId, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT } = {}) {
+function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
     if (!Number.isSafeInteger(sinceEventSeq) || sinceEventSeq < 0) {
@@ -195,6 +248,12 @@ function readProjectSnapshot({ cwd, taskId, sessionId, sinceEventSeq = 0, eventL
       const resolution = resolveTask(store, projectId, { taskId, sessionId, workspaceId: facts.workspaceId });
       const task = resolution.task;
       const tasks = store.listTasks(projectId);
+      // The panel renders the save state from the viewer's perspective; the
+      // agent flow passes its own session-derived owner.
+      const viewer = owner ?? (sessionId ? `project-memory:${sessionId}` : null);
+      const deferredItems = task ? store.listDeferredCommits({ projectId, taskId: task.id }) : [];
+      const deferredCounts = task === null ? null : deferredCountsOf(deferredItems);
+      const leaseStatus = task === null || viewer === null ? null : store.readLeaseStatus({ projectId, taskId: task.id, owner: viewer, now: Date.now() });
       return {
         ok: true,
         initialized: true,
@@ -206,6 +265,15 @@ function readProjectSnapshot({ cwd, taskId, sessionId, sinceEventSeq = 0, eventL
         selectionRequired: resolution.selectionRequired,
         taskCandidates: resolution.candidates ?? [],
         bindingSource: resolution.source,
+        leaseStatus: leaseStatus === null ? null : {
+          heldBy: leaseStatus.heldByCurrentSession ? 'current-session' : leaseStatus.heldByOtherSession ? 'other-session' : 'none',
+          remainingSeconds: leaseStatus.remainingSeconds,
+          canRetryAt: leaseStatus.canRetryAt,
+          retryAfterSeconds: leaseStatus.retryAfterSeconds,
+          diagnostics: leaseStatus.diagnostics,
+        },
+        deferredCounts,
+        deferredItems: deferredItems.map(({ payload, ...item }) => ({ ...item, summary: payload.progress ?? '' })),
         checkpoint: task === null ? null : store.latestCheckpoint(projectId, {
           taskId: task.id,
           branch: facts.branch,
@@ -420,15 +488,61 @@ function checkpoint({
   });
 }
 
+function leaseError(task, requested, status) {
+  const error = new Error('Task lease is held by another session');
+  error.code = 'LEASE_CONFLICT';
+  error.projectId = task.projectId;
+  error.taskId = task.id;
+  error.heldBy = 'other-session';
+  error.retryAfterSeconds = status.retryAfterSeconds;
+  error.canRetryAt = status.canRetryAt;
+  error.requested = requested;
+  return error;
+}
+
+function replayDeferredItem(store, { projectId, taskId, item, owner, lease, facts, sessionId }) {
+  const latest = store.getTask(projectId, taskId);
+  if (item.baseContractVersion !== latest.contractVersion && (item.payload.acceptanceUpdates?.length)) {
+    const error = new Error('Deferred acceptance observation is based on an older contract revision');
+    error.reason = `contract revision moved from ${item.baseContractVersion} to ${latest.contractVersion} while queued`;
+    throw error;
+  }
+  return store.commitCheckpoint({
+    projectId,
+    taskId,
+    expectedTaskVersion: latest.taskVersion,
+    expectedContractVersion: latest.contractVersion,
+    lease,
+    taskPatch: {},
+    evidence: (item.payload.evidenceRefs ?? []).map(ref => ({ kind: 'reference', payload: { ref, deferredFrom: item.sessionId } })),
+    checkpointPayload: {
+      summary: String(item.payload.progress ?? ''),
+      nextAction: null,
+      blockers: [],
+      acceptanceUpdates: item.payload.acceptanceUpdates ?? [],
+      evidenceRefs: item.payload.evidenceRefs ?? [],
+      sessionId: item.sessionId,
+      deferredFlush: true,
+      deferredItemId: item.id,
+      ...sessionId === undefined ? {} : { flushedBy: sessionId },
+    },
+    branch: facts.branch,
+    workspace: facts.workspaceId,
+    idempotencyKey: `deferred:${item.id}`,
+  });
+}
+
 // The public model API intentionally does not accept revisions or fencing
-// tokens.  It acquires a fresh lease, reads the current versions, and lets the
-// store's single transaction reject a concurrent semantic overwrite.
-function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [], acceptanceUpdates = [], evidenceRefs = [], state, idempotencyKey } = {}) {
-  return execute(() => {
+// tokens.  Strict fields (state, next action, blockers) are rejected readably
+// while another session holds the lease; provably independent appends defer
+// into a durable queue that the next lease holder flushes at most once.
+function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [], acceptanceUpdates = [], evidenceRefs = [], state, idempotencyKey, now = Date.now() } = {}) {
+  return executeAsync(async () => {
     const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId');
     if (!Array.isArray(blockers) || !Array.isArray(acceptanceUpdates) || !Array.isArray(evidenceRefs)) throw new TypeError('commit lists must be arrays');
     const projectRoot = requireProjectRoot(currentDirectory);
-    return withStore(projectRoot, store => {
+    const owner = `project-memory:${sessionId}`;
+    return withStoreAsync(projectRoot, async store => {
       const projectId = store.project.id; const facts = workspaceFacts(projectRoot, currentDirectory);
       const resolution = resolveTask(store, projectId, { sessionId, workspaceId: facts.workspaceId });
       if (!resolution.task) {
@@ -438,19 +552,162 @@ function commit({ cwd, sessionId, progress = '', nextAction = null, blockers = [
         throw error;
       }
       const task = resolution.task;
-      const lease = store.acquireLease({ projectId, taskId: task.id, owner: `project-memory:${sessionId}`, ttlMs: 300000 });
-      const latest = store.getTask(projectId, task.id);
-      const data = { ...latest.data, blockers, acceptanceUpdates, nextAction };
-      const result = store.commitCheckpoint({
-        projectId, taskId: latest.id, expectedTaskVersion: latest.taskVersion, expectedContractVersion: latest.contractVersion,
-        lease, taskPatch: { ...(state ? { state } : {}), data },
-        evidence: evidenceRefs.map(ref => ({ kind: 'reference', payload: { ref } })),
-        checkpointPayload: { summary: String(progress), nextAction, blockers, acceptanceUpdates, evidenceRefs, sessionId },
-        branch: facts.branch, workspace: facts.workspaceId, idempotencyKey: idempotencyKey ?? `commit:${sessionId}:${latest.id}:${latest.taskVersion}`,
-      });
-      return { ok: true, projectId, taskId: latest.id, ...result };
+      const requested = { state, nextAction, blockers };
+      const hasStrictFields = state !== undefined || nextAction !== null || blockers.length > 0;
+
+      const attempt = () => {
+        const lease = store.acquireLease({ projectId, taskId: task.id, owner, ttlMs: COMMIT_LEASE_TTL_MS });
+        const latest = store.getTask(projectId, task.id);
+        const data = { ...latest.data, blockers, acceptanceUpdates, nextAction };
+        const result = store.commitCheckpoint({
+          projectId, taskId: latest.id, expectedTaskVersion: latest.taskVersion, expectedContractVersion: latest.contractVersion,
+          lease, taskPatch: { ...(state ? { state } : {}), data },
+          evidence: evidenceRefs.map(ref => ({ kind: 'reference', payload: { ref } })),
+          checkpointPayload: { summary: String(progress), nextAction, blockers, acceptanceUpdates, evidenceRefs, sessionId },
+          branch: facts.branch, workspace: facts.workspaceId, idempotencyKey: idempotencyKey ?? `commit:${sessionId}:${latest.id}:${latest.taskVersion}`,
+        });
+        return { result, lease };
+      };
+
+      let attemptResult;
+      try {
+        attemptResult = attempt();
+      } catch (error) {
+        const retryable = error?.code === 'LEASE_CONFLICT' && error.expiresAt !== undefined;
+        if (!retryable) throw error;
+        const status = store.readLeaseStatus({ projectId, taskId: task.id, owner, now: Date.now() });
+        // One backed-off retry when the foreign lease is about to expire.
+        if (status.heldByOtherSession && status.retryAfterSeconds <= RETRY_WINDOW_SECONDS) {
+          await delay((status.retryAfterSeconds + 0.05) * 1000);
+          try {
+            attemptResult = attempt();
+          } catch (retryError) {
+            return handleLeaseConflict(retryError);
+          }
+        } else {
+          return handleLeaseConflict(error);
+        }
+      }
+      function handleLeaseConflict(error) {
+        if (error?.code !== 'LEASE_CONFLICT') throw error;
+        if (hasStrictFields) {
+          throw leaseError(task, requested, store.readLeaseStatus({ projectId, taskId: task.id, owner, now: Date.now() }));
+        }
+        const existing = store.listDeferredCommits({ projectId, taskId: task.id, sessionId, statuses: ['queued'] })
+          .find(item => item.payload.progress === String(progress)
+            && JSON.stringify(item.payload.evidenceRefs ?? []) === JSON.stringify(evidenceRefs)
+            && JSON.stringify(item.payload.acceptanceUpdates ?? []) === JSON.stringify(acceptanceUpdates));
+        const item = existing ?? store.enqueueDeferredCommit({
+          projectId, taskId: task.id, sessionId,
+          baseTaskVersion: task.taskVersion, baseContractVersion: task.contractVersion,
+          kind: 'append',
+          payload: { progress: String(progress), acceptanceUpdates, evidenceRefs },
+        });
+        return {
+          ok: true, projectId, taskId: task.id, synced: false,
+          deferred: true, deferredItemId: item.id,
+          deferredCount: store.listDeferredCommits({ projectId, taskId: task.id, statuses: ['queued'] }).length,
+        };
+      }
+
+      const { result, lease } = attemptResult;
+      let flushed = 0;
+      let needsReview = 0;
+      // The queue belongs to the task; the new lease holder flushes it at most once.
+      for (const item of store.listDeferredCommits({ projectId, taskId: task.id, statuses: ['queued'] })) {
+        try {
+          replayDeferredItem(store, { projectId, taskId: task.id, item, owner, lease, facts, sessionId });
+          store.updateDeferredCommit({ id: item.id, status: 'flushed' });
+          flushed += 1;
+        } catch (replayError) {
+          store.updateDeferredCommit({ id: item.id, status: 'conflict', reason: replayError.reason ?? replayError.message });
+          needsReview += 1;
+        }
+      }
+      return { ok: true, projectId, taskId: task.id, synced: true, ...result, ...(lease === undefined ? {} : { lease }), flushed, needsReview };
     });
   });
+}
+
+function leaseStatus({ cwd, taskId, sessionId, owner } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => {
+      const projectId = store.project.id;
+      const facts = workspaceFacts(projectRoot, currentDirectory);
+      const resolution = resolveTask(store, projectId, { taskId, sessionId, workspaceId: facts.workspaceId });
+      if (!resolution.task) {
+        const error = new Error(resolution.selectionRequired ? 'Choose a task first' : 'No open task is available');
+        error.code = resolution.selectionRequired ? 'TASK_SELECTION_REQUIRED' : 'NOT_FOUND';
+        throw error;
+      }
+      const viewer = owner ?? `project-memory:${sessionId}`;
+      const status = store.readLeaseStatus({ projectId, taskId: resolution.task.id, owner: viewer, now: Date.now() });
+      return {
+        ok: true,
+        projectId,
+        taskId: resolution.task.id,
+        heldBy: status.heldByCurrentSession ? 'current-session' : status.heldByOtherSession ? 'other-session' : 'none',
+        remainingSeconds: status.remainingSeconds,
+        canRetryAt: status.canRetryAt,
+        retryAfterSeconds: status.retryAfterSeconds,
+        diagnostics: status.diagnostics,
+      };
+    });
+  });
+}
+
+function listDeferredCommits({ cwd, taskId, sessionId } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd);
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => {
+      const projectId = store.project.id;
+      const resolution = resolveTask(store, projectId, { taskId, sessionId: sessionId ?? undefined, workspaceId: workspaceFacts(projectRoot, currentDirectory).workspaceId });
+      const task = resolution.task;
+      if (!task) {
+        const error = new Error(resolution.selectionRequired ? 'Choose a task first' : 'No open task is available');
+        error.code = resolution.selectionRequired ? 'TASK_SELECTION_REQUIRED' : 'NOT_FOUND';
+        throw error;
+      }
+      return {
+        ok: true,
+        projectId,
+        taskId: task.id,
+        items: store.listDeferredCommits({ projectId, taskId: task.id, ...(sessionId === undefined ? {} : { sessionId }) })
+          .map(({ payload, ...item }) => ({ ...item, summary: payload.progress ?? '', evidenceRefs: payload.evidenceRefs ?? [], acceptanceUpdates: payload.acceptanceUpdates ?? [] })),
+      };
+    });
+  });
+}
+
+function discardDeferredCommit({ cwd, id, sessionId } = {}) {
+  return execute(() => {
+    const currentDirectory = resolvedCwd(cwd); requireString(id, 'id');
+    const projectRoot = requireProjectRoot(currentDirectory);
+    return withStore(projectRoot, store => {
+      const projectId = store.project.id;
+      const items = store.listDeferredCommits({ projectId });
+      const item = items.find(entry => entry.id === id);
+      if (!item) {
+        const error = new Error(`Deferred commit ${id} was not found`);
+        error.code = 'NOT_FOUND';
+        throw error;
+      }
+      if (sessionId !== undefined && item.sessionId !== sessionId) {
+        const error = new Error('Only the session that queued a draft can discard it');
+        error.code = 'DEFERRED_OWNER_CONFLICT';
+        throw error;
+      }
+      const updated = store.updateDeferredCommit({ id, status: 'discarded', reason: 'discarded by user request' });
+      return { ok: true, projectId, item: updated };
+    });
+  });
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function search({ cwd, taskId, query = '', limit = 20 } = {}) {
@@ -545,6 +802,9 @@ const operations = Object.freeze({
   claim,
   checkpoint,
   commit,
+  leaseStatus,
+  listDeferredCommits,
+  discardDeferredCommit,
   search,
   proposeContractChange,
   startTask,
@@ -561,6 +821,9 @@ export {
   claim,
   checkpoint,
   commit,
+  leaseStatus,
+  listDeferredCommits,
+  discardDeferredCommit,
   search,
   proposeContractChange,
   startTask,

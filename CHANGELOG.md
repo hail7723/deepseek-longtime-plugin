@@ -25,6 +25,33 @@ All notable changes to this project will be documented in this file.
 
 - Do not read the non-injected Harness `ctx.config` property during `agent/created`; this previously prevented real session creation with `cannot get property "config" without inject`.
 
+## [0.3.0-dev.4] - 2026-10-25
+
+Remediation R00 + R01 + R02. Evidence: `docs/v0.3-lease-and-session-evidence.md`.
+
+### Fixed
+
+- `workspace` Remote registered a zero-argument wire signature because of a default parameter; every real gateway call failed with `gateway/signature-invalid`. Covered by the new `test/session-interface.test.js` real-gateway integration test.
+- `memory_commit` no longer locks a task against every other session for five minutes: the commit lease is short (60 s) and renewable, a normal `agent/disposed` releases this session's own lease, and a foreign lease that is about to expire triggers one backed-off retry instead of an immediate failure.
+
+### Added
+
+- `memory_lease_status` tool and `leaseStatus`/`deferred`/`discardDeferred` Remotes return readable save state (`heldBy`, `remainingSeconds`, `canRetryAt`, `retryAfterSeconds`); owner, fence, and raw timestamps stay in a diagnostics object.
+- Durable `deferred_commits` queue (schema v3, with `memory.sqlite.v2-backup` recovery copies before migration). Strict commit fields (state, next action, blockers) are rejected readably under a foreign lease; provably independent appends defer, and the next lease holder flushes the queue at most once, keeping conflicting items for review instead of dropping them.
+- Panel save-state bar (`已保存于…` / `正在保存` / `等待另一会话（约 N 秒）` / `未保存—可重试`) with retry-save, discard-draft actions, a deferred-draft list (`排队中`/`需要复核`), Chinese error mapping, relative timestamps, and a diagnostics-only area for code/owner/ISO/fence.
+- Session-bound task selection: completing or archiving a task invalidates only its own session binding, which must then re-select explicitly (`invalidated-binding`); it never silently adopts the remaining open task. Unbound sessions with multiple open tasks get `TASK_SELECTION_REQUIRED` everywhere, including commits.
+- v0.3 panel flow through new `startTask`/`useTask`/`listTasks`/`setTaskState`/`commit` Remotes; the Client passes its slot-scoped `sessionId` (single-window `workspace` fallback), the panel offers an explicit task list with select/new/pause/complete/archive, and a selection banner replaces guessing.
+
+### Not yet verified
+
+- Real Desktop profile run of the new lease/deferred/task flow (A/B sessions, dispose release, queue flush, multi-window session ids) and R03–R06; no paid model request was made.
+
+## [0.3.0-dev.3] - 2026-10-25
+
+### Changed
+
+- The panel derives its path from the active Harness conversation's committed workspace and shows it read-only. It no longer asks users to type a directory or reuses a process-wide directory from another window.
+
 ## [0.2.2] - 2026-10-24
 
 ### Added

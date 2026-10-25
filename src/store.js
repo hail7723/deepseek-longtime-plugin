@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const TASK_STATES = new Set(['active', 'paused', 'blocked', 'completed', 'archived']);
 const TRANSITIONS = Object.freeze({
   active: new Set(['paused', 'blocked', 'completed', 'archived']),
@@ -124,6 +124,24 @@ function mapToolOperation(row) {
     finishedAt: row.finished_at, resultSummary: decode(row.result_summary_json), evidenceRef: row.evidence_ref };
 }
 
+function mapDeferredCommit(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    taskId: row.task_id,
+    sessionId: row.session_id,
+    baseTaskVersion: Number(row.base_task_version),
+    baseContractVersion: Number(row.base_contract_version),
+    kind: row.kind,
+    payload: decode(row.payload_json),
+    status: row.status,
+    createdAt: row.created_at,
+    flushedAt: row.flushed_at,
+    reason: row.reason,
+  };
+}
+
 function mapEvent(row) {
   if (!row) return null;
   return {
@@ -224,14 +242,14 @@ class ProjectMemoryStore {
 
     const markerSchemaVersion = marker.schema_version ?? marker.schemaVersion;
     const markerProjectId = marker.project_id ?? marker.projectId;
-    if (![1, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
+    if (![1, 2, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
       throw new StoreError(`Invalid project marker at ${markerPath}`, 'INVALID_PROJECT_MARKER', { markerPath });
     }
     const databasePath = options.databasePath ?? path.join(stateDirectory, DEFAULT_DATABASE_FILE);
-    // A v1 database is never changed without a same-directory recovery copy.  Keep
-    // WAL sidecars too: they can contain the most recent v1 transactions.
-    if (markerSchemaVersion === 1 && fs.existsSync(databasePath)) {
-      const backup = `${databasePath}.v1-backup`;
+    // An older database is never migrated in place without a same-directory
+    // recovery copy.  WAL sidecars can hold the most recent transactions.
+    if (markerSchemaVersion < SCHEMA_VERSION && fs.existsSync(databasePath)) {
+      const backup = `${databasePath}.v${markerSchemaVersion}-backup`;
       if (!fs.existsSync(backup)) {
         fs.copyFileSync(databasePath, backup);
         for (const suffix of ['-wal', '-shm']) {
@@ -391,6 +409,31 @@ class ProjectMemoryStore {
               payload.sourceRef == null ? null : encode(payload.sourceRef), duplicate ? 'superseded' : 'pending',
               event.created_at, duplicate ? event.created_at : null, duplicate ? 'migration:duplicate' : null);
         }
+        this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
+      });
+    }
+    if (version < 3) {
+      // Additive only: durable queue for commits deferred behind another
+      // session's live lease.  Nothing existing is rewritten.
+      this.#transaction(() => {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS deferred_commits (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            task_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            base_task_version INTEGER NOT NULL,
+            base_contract_version INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('queued','flushed','conflict','discarded')),
+            created_at TEXT NOT NULL,
+            flushed_at TEXT,
+            reason TEXT,
+            FOREIGN KEY(project_id, task_id) REFERENCES tasks(project_id, id)
+          ) STRICT;
+          CREATE INDEX IF NOT EXISTS deferred_commits_task ON deferred_commits(project_id, task_id, status, created_at);
+        `);
         this.db.prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'").run(String(SCHEMA_VERSION));
       });
     }
@@ -579,6 +622,69 @@ class ProjectMemoryStore {
   markPendingOperationsUnknown({ sessionId, taskId }) {
     this.db.prepare(`UPDATE tool_operations SET status = 'unknown', finished_at = ? WHERE session_id = ? AND task_id = ? AND status = 'pending'`)
       .run(nowIso(), sessionId, taskId);
+  }
+
+  enqueueDeferredCommit({ projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, payload, id = randomUUID(), now = Date.now() }) {
+    requireString(projectId, 'projectId');
+    requireString(taskId, 'taskId');
+    requireString(sessionId, 'sessionId');
+    requireString(kind, 'kind');
+    if (!Number.isSafeInteger(baseTaskVersion) || baseTaskVersion < 1) throw new TypeError('baseTaskVersion must be positive');
+    if (!Number.isSafeInteger(baseContractVersion) || baseContractVersion < 1) throw new TypeError('baseContractVersion must be positive');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new TypeError('payload must be an object');
+    return this.#transaction(() => {
+      this.#requireTask(projectId, taskId);
+      const timestamp = nowIso();
+      this.db.prepare(`INSERT INTO deferred_commits(
+          id, project_id, task_id, session_id, base_task_version, base_contract_version,
+          kind, payload_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)`)
+        .run(id, projectId, taskId, sessionId, baseTaskVersion, baseContractVersion, kind, encode(payload), timestamp);
+      return mapDeferredCommit(this.db.prepare('SELECT * FROM deferred_commits WHERE id = ?').get(id));
+    });
+  }
+
+  listDeferredCommits({ projectId, taskId, sessionId, statuses } = {}) {
+    const clauses = ['project_id = ?'];
+    const params = [projectId];
+    if (taskId !== undefined) { clauses.push('task_id = ?'); params.push(taskId); }
+    if (sessionId !== undefined) { clauses.push('session_id = ?'); params.push(sessionId); }
+    if (statuses?.length) { clauses.push(`status IN (${statuses.map(() => '?').join(',')})`); params.push(...statuses); }
+    return this.db.prepare(`SELECT * FROM deferred_commits WHERE ${clauses.join(' AND ')} ORDER BY created_at, id`).all(...params).map(mapDeferredCommit);
+  }
+
+  updateDeferredCommit({ id, status, reason = null, now = Date.now() }) {
+    if (!['queued', 'flushed', 'conflict', 'discarded'].includes(status)) throw new TypeError('Invalid deferred commit status');
+    const flushedAt = status === 'flushed' ? nowIso() : null;
+    const result = this.db.prepare('UPDATE deferred_commits SET status = ?, reason = ?, flushed_at = ? WHERE id = ? AND status = \'queued\'').run(status, reason, flushedAt, id);
+    if (Number(result.changes) !== 1) {
+      const existing = this.db.prepare('SELECT status FROM deferred_commits WHERE id = ?').get(id);
+      if (!existing) throw new StoreError('Deferred commit not found', 'NOT_FOUND', { id });
+      throw new StoreError('Deferred commit is not queued', 'DEFERRED_STATE_CONFLICT', { id, status: existing.status });
+    }
+    return mapDeferredCommit(this.db.prepare('SELECT * FROM deferred_commits WHERE id = ?').get(id));
+  }
+
+  readLeaseStatus({ projectId, taskId, owner, now = Date.now() }) {
+    const task = this.#requireTask(projectId, taskId);
+    const live = task.leaseOwner !== null && task.leaseExpiresAt > now;
+    const remainingSeconds = live ? Math.max(0, Math.ceil((task.leaseExpiresAt - now) / 1000)) : 0;
+    return {
+      live,
+      heldByCurrentSession: live && task.leaseOwner === owner,
+      heldByOtherSession: live && task.leaseOwner !== owner,
+      remainingSeconds,
+      canRetryAt: live ? new Date(task.leaseExpiresAt + 1).toISOString() : new Date(now).toISOString(),
+      retryAfterSeconds: live ? Math.max(0, Math.ceil((task.leaseExpiresAt + 1 - now) / 1000)) : 0,
+      diagnostics: {
+        owner: task.leaseOwner,
+        fence: task.leaseFence,
+        expiresAt: task.leaseExpiresAt,
+        taskId: task.id,
+        taskVersion: task.taskVersion,
+        contractVersion: task.contractVersion,
+      },
+    };
   }
 
   updateTask({ projectId, taskId, expectedVersion, patch, idempotencyKey, lease }) {

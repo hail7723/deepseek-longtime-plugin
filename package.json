@@ -1,6 +1,6 @@
 {
   "name": "dsh-longtime-memory",
-  "version": "0.3.0-dev.2",
+  "version": "0.3.0-dev.4",
   "description": "Local SQLite project memory for DeepSeek Harness with a native panel, durable recovery, and revision conflict checks.",
   "type": "module",
   "license": "MIT",
@@ -55,7 +55,7 @@
   },
   "scripts": {
     "check": "node --check index.js && node --check client.js && node --check src/plugin.js && node --check src/operations.js && node --check src/service.js && node --check src/store.js",
-    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js test/operations.test.js test/service.test.js test/client.test.js test/gateway-runtime.test.js test/v03.test.js",
+    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js test/operations.test.js test/service.test.js test/client.test.js test/gateway-runtime.test.js test/session-interface.test.js test/v03.test.js test/r01-lease.test.js test/r02-tasks.test.js",
     "pack:check": "npm pack --dry-run"
   },
   "publishConfig": {

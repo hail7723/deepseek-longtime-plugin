@@ -6,6 +6,9 @@ import {
   bootstrap as bootstrapOperation,
   checkpoint as checkpointOperation,
   claim as claimOperation,
+  discardDeferredCommit as discardDeferredCommitOperation,
+  leaseStatus as leaseStatusOperation,
+  listDeferredCommits as listDeferredCommitsOperation,
   proposeContractChange as proposeContractChangeOperation,
   readProjectSnapshot,
   search as searchOperation,
@@ -248,18 +251,18 @@ class AgentMemoryBinding {
       sourceRef: args.source_ref ?? `session:${this.agent.id}`,
       idempotencyKey: args.idempotency_key,
     });
-    if (result.ok) this.taskId = result.task.id;
+    if (result.ok) { this.refresh(false); this.taskId = result.task.id; }
     return result;
   }
 
   useTask(args) {
     const result = useTaskOperation({ cwd: this.cwd, sessionId: String(this.agent.id), taskId: args.task_id });
-    if (result.ok) this.taskId = result.task.id;
+    if (result.ok) { this.refresh(false); this.taskId = result.task.id; }
     return result;
   }
 
-  commit(args) {
-    const result = commitOperation({
+  async commit(args) {
+    const result = await commitOperation({
       cwd: this.cwd,
       sessionId: String(this.agent.id),
       progress: args.progress ?? '',
@@ -270,8 +273,37 @@ class AgentMemoryBinding {
       state: args.state,
       idempotencyKey: args.idempotency_key,
     });
-    if (result.ok) this.taskId = result.taskId;
+    if (result.ok) {
+      this.taskId = result.taskId;
+      // Remember the lease we now hold so a normal dispose can release it;
+      // a crashed process still falls back to the TTL.
+      if (result.synced && result.lease) this.lease = result.lease;
+    }
     return result;
+  }
+
+  leaseStatus(args) {
+    return leaseStatusOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      sessionId: String(this.agent.id),
+    });
+  }
+
+  deferredCommits(args) {
+    return listDeferredCommitsOperation({
+      cwd: this.cwd,
+      taskId: args.task_id ?? this.taskId ?? undefined,
+      sessionId: String(this.agent.id),
+    });
+  }
+
+  discardDeferredCommit(args) {
+    return discardDeferredCommitOperation({
+      cwd: this.cwd,
+      id: args.id,
+      sessionId: String(this.agent.id),
+    });
   }
 
   listTasks() {
@@ -522,6 +554,11 @@ class AgentMemoryBinding {
   }
 
   close() {
+    if (this.store && this.taskId && this.projectId && this.lease) {
+      // Best-effort release on normal dispose; `agent/disposed` listeners are
+      // not awaited by the Host, and a crash still relies on the lease TTL.
+      try { this.store.releaseLease({ projectId: this.projectId, taskId: this.taskId, owner: this.lease.owner, fence: this.lease.fence }); } catch { /* already moved on */ }
+    }
     if (this.store && this.taskId) {
       try { this.store.markPendingOperationsUnknown({ sessionId: String(this.agent.id), taskId: this.taskId }); } catch { /* shutdown must not throw */ }
     }
@@ -536,7 +573,10 @@ class AgentMemoryBinding {
 const definitions = [
   { name: 'memory_start_task', method: 'startTask', description: 'Start a confirmed long-running task. The Host creates its id and binding.', parameters: objectSchema({ objective: { type: 'string' }, acceptance_criteria: { type: 'array', items: { type: 'string' } }, constraints: { type: 'array', items: { type: 'string' } }, next_action: { type: 'string' }, source_ref: { type: 'string' }, idempotency_key: { type: 'string' } }, ['objective']) },
   { name: 'memory_use_task', method: 'useTask', description: 'Explicitly select one task for this session.', parameters: objectSchema({ task_id: { type: 'string' } }, ['task_id']) },
-  { name: 'memory_commit', method: 'commit', description: 'Save progress for the selected task. The Host handles revisions, leases, and fencing.', parameters: objectSchema({ progress: { type: 'string' }, next_action: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, acceptance_updates: { type: 'array', items: { type: 'object', additionalProperties: true } }, evidence_refs: { type: 'array', items: { type: 'string' } }, state: { type: 'string' }, idempotency_key: { type: 'string' } }) },
+  { name: 'memory_commit', method: 'commit', description: 'Save progress for the selected task. Strict fields (state, next_action, blockers) are rejected readably while another session holds the lease; independent appends (evidence, observations) defer into a durable queue that the next lease holder flushes.', parameters: objectSchema({ progress: { type: 'string' }, next_action: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, acceptance_updates: { type: 'array', items: { type: 'object', additionalProperties: true } }, evidence_refs: { type: 'array', items: { type: 'string' } }, state: { type: 'string' }, idempotency_key: { type: 'string' } }) },
+  { name: 'memory_lease_status', method: 'leaseStatus', description: 'Read the save state of the selected task: who holds the write lease, how long until a retry is possible. No fence or raw timestamps in the normal output.', parameters: objectSchema({ task_id: { type: 'string' } }) },
+  { name: 'memory_deferred_list', method: 'deferredCommits', description: 'List deferred (unsynced) drafts for the selected task, including queued/conflict/flushed status.', parameters: objectSchema({ task_id: { type: 'string' } }) },
+  { name: 'memory_deferred_discard', method: 'discardDeferredCommit', description: 'Discard one of this session\'s queued drafts so it is never flushed.', parameters: objectSchema({ id: { type: 'string' } }, ['id']) },
   { name: 'memory_search', method: 'search', description: 'Search bounded local history and evidence on demand.', parameters: objectSchema({ query: { type: 'string' }, task_id: { type: 'string' }, limit: { type: 'integer' } }, ['query']) },
   { name: 'memory_propose_contract_change', method: 'propose', description: 'Propose a contract change for later user acceptance or rejection.', parameters: objectSchema({ task_id: { type: 'string' }, diff: { type: 'object', additionalProperties: true }, source_ref: { type: 'string' }, idempotency_key: { type: 'string' } }, ['diff', 'source_ref']) },
 ];
@@ -577,7 +617,7 @@ function registerAgent(agent, cwd, logger, options = { compatibilityTools: true 
           return normalizeError(error);
         }
       },
-      isConcurrencySafe: () => definition.name === 'memory_search' || definition.name === 'memory_list_tasks',
+      isConcurrencySafe: () => ['memory_search', 'memory_list_tasks', 'memory_lease_status', 'memory_deferred_list'].includes(definition.name),
     }));
   }
   disposers.push(agent.ctx.on('tools/pre-execute', async (exec, next) => {

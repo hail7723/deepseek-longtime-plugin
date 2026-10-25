@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
 
     const PROJECT_MEMORY_REMOTE = Object.freeze({
       package: 'dsh-longtime-memory',
-      descriptors: Object.freeze(['snapshot', 'bootstrap', 'claim', 'checkpoint', 'search', 'proposeContract'].map(method => Object.freeze({
+      descriptors: Object.freeze(['workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract'].map(method => Object.freeze({
         id: `dsh-longtime-memory#projectMemory/${method}`,
         service: 'projectMemory',
         namespace: 'projectMemory',
@@ -49,9 +49,42 @@ window.__ModuleLoader__.load({
 
     const TEXT = {
       title: '项目记忆', overview: '概览', tasks: '任务', contracts: '契约', history: '历史',
-      cwd: '当前工作目录', refresh: '刷新', refreshing: '刷新中…', uninitialized: '当前目录尚未初始化项目记忆',
+      cwd: '当前工作区', refresh: '刷新', refreshing: '刷新中…', uninitialized: '当前工作区尚未初始化项目记忆',
       bootstrap: '初始化项目', claim: '领取当前任务', checkpoint: '创建 Checkpoint', search: '搜索历史',
       propose: '提出契约变更', submit: '提交', success: '操作成功', empty: '暂无数据',
+      savedAt: iso => `已保存于 ${formatRelative(iso)}`, saving: '正在保存',
+      waitingLease: seconds => `等待另一会话保存（约 ${Math.max(1, Math.round(seconds))} 秒后可重试）`,
+      unsaved: '未保存 — 可重试', retrySave: '重试保存', keepDraft: '保留为待同步草稿',
+      discardDraft: '取消草稿', diagnostics: '诊断详情', draftKept: '草稿已保留在本面板，稍后可重试保存',
+    };
+
+    function formatRelative(iso) {
+      const time = Date.parse(iso);
+      if (!Number.isFinite(time)) return first(iso, '—');
+      const seconds = Math.round((Date.now() - time) / 1000);
+      if (seconds < 45) return '刚刚';
+      if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟前`;
+      if (seconds < 86400) return `${Math.round(seconds / 3600)} 小时前`;
+      if (seconds < 172800) return `昨天 ${new Date(time).toTimeString().slice(0, 5)}`;
+      return new Date(time).toLocaleString();
+    }
+
+    // UI-safe Chinese copy per error code.  Raw codes, owners, ISO timestamps
+    // and fences are only shown inside the diagnostics area.
+    const CODE_TEXT = {
+      LEASE_CONFLICT: e => `另一会话正在保存，约 ${Math.max(1, Math.round(Number(e.retryAfterSeconds ?? 60)))} 秒后可重试`,
+      SESSION_REQUIRED: () => '无法确定当前会话，请从项目会话窗口打开本面板后重试',
+      WORKSPACE_UNAVAILABLE: () => '当前会话没有可用工作区，请在项目会话中打开本面板',
+      WORKSPACE_SELECTION_REQUIRED: () => '存在多个活动工作区，请从对应的会话窗口打开本面板',
+      TASK_SELECTION_REQUIRED: () => '有多个未完成任务，请先明确选择一个任务',
+      NOT_FOUND: () => '未找到对应记录，请刷新后重试',
+      PROJECT_MEMORY_NOT_INITIALIZED: () => '当前工作区尚未初始化项目记忆',
+      PROJECT_MEMORY_ERROR: () => '本地记忆存储读写失败，请查看诊断详情',
+      TASK_REVISION_CONFLICT: () => '任务已被其他会话更新，请刷新后基于最新状态重试',
+      CONTRACT_REVISION_CONFLICT: () => '契约已被更新，请刷新后基于最新状态重试',
+      IDEMPOTENCY_CONFLICT: () => '重复的提交被拒绝',
+      DEFERRED_OWNER_CONFLICT: () => '只有创建该草稿的会话可以取消它',
+      DEFERRED_STATE_CONFLICT: () => '草稿状态已变化，请刷新后重试',
     };
 
     const CSS = `
@@ -61,7 +94,9 @@ window.__ModuleLoader__.load({
       .pm-title{margin:0;font-size:24px;line-height:32px;font-weight:650;letter-spacing:0}.pm-subtitle{margin:5px 0 0;color:var(--dsw-alias-label-secondary);font-size:13px;overflow-wrap:anywhere}
       .pm-actions,.pm-inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.pm-btn{min-height:34px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);padding:0 12px;font:inherit;font-size:13px;cursor:pointer}.pm-btn:hover{border-color:var(--dsw-alias-brand-primary)}.pm-btn:disabled{cursor:not-allowed;opacity:.55}.pm-btn-primary{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
       .pm-tabs{display:flex;gap:20px;border-bottom:1px solid var(--dsw-alias-border-l1);margin-bottom:22px}.pm-tab{border:0;border-bottom:2px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);padding:14px 2px 12px;font:inherit;font-size:14px;cursor:pointer}.pm-tab[aria-selected=true]{color:var(--dsw-alias-label-primary);border-bottom-color:var(--dsw-alias-brand-primary);font-weight:600}
-      .pm-workspace{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;margin:18px 0 0}.pm-input,.pm-textarea,.pm-select{box-sizing:border-box;width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:8px 10px;outline:none}.pm-input:focus,.pm-textarea:focus,.pm-select:focus{border-color:var(--dsw-alias-brand-primary)}.pm-textarea{min-height:86px;resize:vertical;line-height:1.45}
+      .pm-workspace{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:10px;margin:18px 0 0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}.pm-workspace-label{font-size:12px;color:var(--dsw-alias-label-secondary)}.pm-workspace-path{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;overflow-wrap:anywhere}.pm-input,.pm-textarea,.pm-select{box-sizing:border-box;width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;padding:8px 10px;outline:none}.pm-input:focus,.pm-textarea:focus,.pm-select:focus{border-color:var(--dsw-alias-brand-primary)}.pm-textarea{min-height:86px;resize:vertical;line-height:1.45}
+      .pm-save{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:16px 0 0;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);border-left:3px solid var(--dsw-alias-state-success-primary);border-radius:6px;background:var(--dsw-alias-bg-layer-1);font-size:13px}.pm-save-label{font-weight:600}.pm-save-saving{border-left-color:var(--dsw-alias-state-idle-primary)}.pm-save-waiting{border-left-color:var(--dsw-alias-state-warn-primary)}.pm-save-unsaved{border-left-color:var(--dsw-alias-state-error-primary)}.pm-save-toggle{border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer;padding:0}.pm-save-toggle:hover{color:var(--dsw-alias-label-primary)}.pm-save-note{flex-basis:100%;color:var(--dsw-alias-label-secondary);font-size:12px}
+      .pm-draft-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center}
       .pm-status{margin:16px 0;padding:10px 12px;border-left:3px solid var(--dsw-alias-state-idle-primary);background:var(--dsw-alias-bg-layer-1);font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}.pm-status-success{border-left-color:var(--dsw-alias-state-success-primary)}.pm-status-error{border-left-color:var(--dsw-alias-state-error-primary)}.pm-status-conflict{border-left-color:var(--dsw-alias-state-warn-primary)}
       .pm-metrics{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));border:1px solid var(--dsw-alias-border-l1);border-radius:6px;margin:20px 0}.pm-metric{padding:14px 16px;border-right:1px solid var(--dsw-alias-border-l1)}.pm-metric:last-child{border-right:0}.pm-metric-label{font-size:12px;color:var(--dsw-alias-label-secondary)}.pm-metric-value{margin-top:5px;font-size:16px;font-weight:600;overflow-wrap:anywhere}
       .pm-section{padding:20px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}.pm-section:last-child{border-bottom:0}.pm-section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.pm-h2{margin:0;font-size:16px;line-height:22px;font-weight:650}.pm-muted{color:var(--dsw-alias-label-secondary);font-size:13px}.pm-copy{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.6}
@@ -78,9 +113,10 @@ window.__ModuleLoader__.load({
     function errorInfo(error) {
       const value = error && typeof error === 'object' ? error : { message: String(error) };
       const code = String(value.code || value.errorCode || value.name || 'ERROR');
-      const message = value.message || value.reason || '操作失败';
-      const conflict = /CONFLICT|REVISION|LEASE|FENCE|STALE/i.test(code + ' ' + message);
-      return { type: conflict ? 'conflict' : 'error', title: conflict ? '检测到并发冲突' : '操作失败', message: `${code}: ${message}`, detail: value };
+      const mapped = CODE_TEXT[code];
+      const message = mapped ? mapped(value) : (value.message || value.reason || '操作失败');
+      const conflict = /CONFLICT|REVISION|LEASE|FENCE|STALE/i.test(code + ' ' + String(value.message || ''));
+      return { type: conflict ? 'conflict' : 'error', title: conflict ? '保存冲突' : '操作失败', message, code, detail: value };
     }
     function field(label, child, extra) { return h('label', { className: `pm-field${extra ? ` ${extra}` : ''}` }, h('span', { className: 'pm-label' }, label), child); }
     function input(value, onChange, props) { return h('input', { className: 'pm-input', value, onChange: e => onChange(e.target.value), ...props }); }
@@ -105,17 +141,40 @@ window.__ModuleLoader__.load({
         value.type === 'conflict' ? h('div', { className: 'pm-conflict' }, button('重新加载最新状态', onReload, false, false), h('pre', { className: 'pm-pre' }, json(value.detail))) : null);
     }
 
-    function ProjectMemoryPanel({ api }) {
+    function SaveStatus({ lease, deferred, checkpointAt, busy, draftKept, onRetry, onDiscard, onReload }) {
+      const [showDiagnostics, setShowDiagnostics] = useState(false);
+      let tone = 'saved'; let label = checkpointAt ? TEXT.savedAt(checkpointAt) : '尚未保存过';
+      if (busy) { tone = 'saving'; label = TEXT.saving; }
+      else if (lease && lease.heldBy === 'other-session') { tone = 'waiting'; label = TEXT.waitingLease(lease.retryAfterSeconds ?? lease.remainingSeconds ?? 60); }
+      else if ((deferred && deferred.queued > 0) || draftKept) { tone = 'unsaved'; label = TEXT.unsaved; }
+      const actions = [];
+      if (tone === 'waiting' || tone === 'unsaved') actions.push(button(TEXT.retrySave, onRetry, false, Boolean(busy)));
+      if (deferred && deferred.queued > 0) actions.push(button(TEXT.discardDraft, onDiscard, false, Boolean(busy)));
+      const diagnostics = lease && lease.diagnostics;
+      return h('div', { className: `pm-save pm-save-${tone}`, role: 'status' },
+        h('span', { className: 'pm-save-label' }, label),
+        actions.length ? h('span', { className: 'pm-inline' }, actions) : null,
+        diagnostics ? h('button', { type: 'button', className: 'pm-save-toggle', onClick: () => setShowDiagnostics(v => !v) }, TEXT.diagnostics) : null,
+        draftKept && tone !== 'saving' ? h('div', { className: 'pm-save-note' }, TEXT.draftKept) : null,
+        showDiagnostics && diagnostics ? h('pre', { className: 'pm-pre' }, json(diagnostics)) : null,
+      );
+    }
+
+    function ProjectMemoryPanel({ api, sessionId: scopedSessionId }) {
       const [tab, setTab] = useState('overview');
       const [cwd, setCwd] = useState('');
+      const [sessionId, setSessionId] = useState(typeof scopedSessionId === 'string' && scopedSessionId ? scopedSessionId : '');
       const [data, setData] = useState(null);
       const [busy, setBusy] = useState('');
       const [feedback, setFeedback] = useState(null);
       const [bootstrap, setBootstrap] = useState({ taskId: '', objective: '', criteria: '', constraints: '' });
-      const [checkpoint, setCheckpoint] = useState({ summary: '', nextAction: '', evidence: '', pending: '' });
+      const [commit, setCommit] = useState({ progress: '', nextAction: '', blockers: '', evidence: '' });
+      const [newTask, setNewTask] = useState({ objective: '', criteria: '', constraints: '' });
       const [search, setSearch] = useState({ query: '', limit: '20' });
       const [results, setResults] = useState([]);
       const [proposal, setProposal] = useState({ sourceRef: '', diff: '' });
+      const [lastCommitArgs, setLastCommitArgs] = useState(null);
+      const [draftKept, setDraftKept] = useState(false);
 
       const task = data && (data.task || data.currentTask) || {};
       const contract = data && (data.contract || data.confirmedContract) || {};
@@ -136,10 +195,20 @@ window.__ModuleLoader__.load({
         } catch (error) { setFeedback(errorInfo(error)); return null; }
         finally { setBusy(''); }
       }
-      async function load(quiet) {
+      async function resolveWorkspace() {
+        const workspace = await api('workspace', {});
+        if (!workspace || workspace.ok === false || !workspace.cwd) throw (workspace && workspace.error) || new Error('当前会话没有可用工作区');
+        setCwd(workspace.cwd);
+        // The session-scoped slot prop wins; the Host's sole-candidate answer
+        // is the single-window fallback only.
+        if (!sessionId && workspace.sessionId) setSessionId(workspace.sessionId);
+        return workspace.cwd;
+      }
+      async function load(quiet, requestedCwd) {
         setBusy('snapshot'); if (!quiet) setFeedback(null);
         try {
-          const next = await api('snapshot', cwd ? { cwd } : {});
+          const activeCwd = requestedCwd || cwd || await resolveWorkspace();
+          const next = await api('snapshot', { cwd: activeCwd, ...(sessionId ? { session_id: sessionId } : {}) });
           if (next && next.ok === false) throw next.error || next;
           setData(next || {});
           const nextCwd = next && (next.cwd || next.workingDirectory || next.root);
@@ -148,18 +217,55 @@ window.__ModuleLoader__.load({
         } catch (error) { setFeedback(errorInfo(error)); }
         finally { setBusy(''); }
       }
-      useEffect(() => { let live = true; api('snapshot', {}).then(next => { if (!live) return; if (next && next.ok === false) throw next.error || next; setData(next || {}); setCwd((next && (next.cwd || next.workingDirectory || next.root)) || ''); }).catch(error => { if (live) setFeedback(errorInfo(error)); }); return () => { live = false; }; }, [api]);
+      useEffect(() => { let live = true; resolveWorkspace().then(activeCwd => { if (live) return load(true, activeCwd); return null; }).catch(error => { if (live) setFeedback(errorInfo(error)); }); return () => { live = false; }; }, [api]);
 
       async function doBootstrap() {
         const criteria = bootstrap.criteria.split('\n').map(x => x.trim()).filter(Boolean);
         const constraints = bootstrap.constraints.split('\n').map(x => x.trim()).filter(Boolean);
         await invoke('bootstrap', { cwd, task_id: bootstrap.taskId.trim(), objective: bootstrap.objective.trim(), acceptance_criteria: criteria, constraints, source_ref: 'project-memory-ui' }, '项目记忆已初始化', true);
       }
-      async function doClaim() { await invoke('claim', { cwd, task_id: taskId, expected_revision: Number(taskRevision), lease_seconds: 300 }, '任务已领取，租约有效期 5 分钟', true); }
-      async function doCheckpoint() {
-        let evidence = []; let pending = [];
-        try { evidence = checkpoint.evidence.trim() ? JSON.parse(checkpoint.evidence) : []; pending = checkpoint.pending.split('\n').map(x => x.trim()).filter(Boolean); } catch (error) { setFeedback({ type: 'error', title: '输入格式错误', message: `证据必须是 JSON：${error.message}` }); return; }
-        await invoke('checkpoint', { cwd, task_id: taskId, expected_revision: Number(taskRevision), expected_contract_revision: Number(contractRevision), lease_token: Number(leaseToken), summary: checkpoint.summary, next_action: checkpoint.nextAction, evidence, pending_operations: pending, idempotency_key: `ui-checkpoint-${Date.now()}` }, 'Checkpoint 已保存', true);
+      function requireSession(label) {
+        if (!sessionId) {
+          const error = new Error('无法确定当前会话；请从项目会话窗口打开本面板');
+          error.code = 'SESSION_REQUIRED';
+          setFeedback(errorInfo(error));
+          return null;
+        }
+        return sessionId;
+      }
+      async function doStartTask() {
+        const who = requireSession(); if (!who) return;
+        const criteria = newTask.criteria.split('\n').map(x => x.trim()).filter(Boolean);
+        const constraints = newTask.constraints.split('\n').map(x => x.trim()).filter(Boolean);
+        const result = await invoke('startTask', { cwd, session_id: who, objective: newTask.objective.trim(), acceptance_criteria: criteria, constraints }, '任务已创建并绑定到当前会话', true);
+        if (result) setNewTask({ objective: '', criteria: '', constraints: '' });
+      }
+      async function doUseTask(taskId) {
+        const who = requireSession(); if (!who) return;
+        await invoke('useTask', { cwd, session_id: who, task_id: taskId }, '已切换当前会话的任务', true);
+      }
+      async function doSetTaskState(taskId, state, label) {
+        await invoke('setTaskState', { cwd, task_id: taskId, state }, `任务已${label}`, true);
+      }
+      async function doCommit() {
+        const who = requireSession(); if (!who) return;
+        const blockers = commit.blockers.split('\n').map(x => x.trim()).filter(Boolean);
+        const evidenceRefs = commit.evidence.split('\n').map(x => x.trim()).filter(Boolean);
+        const args = { cwd, session_id: who, progress: commit.progress, next_action: commit.nextAction || undefined, blockers, evidence_refs: evidenceRefs };
+        setLastCommitArgs(args); setDraftKept(false);
+        const result = await invoke('commit', args, '进度已保存', true);
+        if (result) { setCommit({ progress: '', nextAction: '', blockers: '', evidence: '' }); }
+        else setDraftKept(true);
+      }
+      async function retrySave() {
+        if (lastCommitArgs) {
+          setDraftKept(false);
+          const result = await invoke('commit', lastCommitArgs, '进度已保存', true);
+          if (result) setCommit({ progress: '', nextAction: '', blockers: '', evidence: '' });
+        } else { await load(false); }
+      }
+      async function discardDraft(id) {
+        await invoke('discardDeferred', { cwd, id }, '草稿已取消，不会再同步', true);
       }
       async function doSearch() {
         setBusy('search'); setFeedback(null);
@@ -176,6 +282,14 @@ window.__ModuleLoader__.load({
         ['Project ID', first(data && (data.project_id || data.projectId), '—')],
         ['Task revision', taskRevision], ['Contract revision', contractRevision], ['Event seq', first(data && (data.event_seq || data.eventSeq), '—')],
       ];
+      const deferredItems = asArray(data && data.deferredItems);
+      const deferredCounts = (data && data.deferredCounts) || { queued: 0, flushed: 0, conflict: 0, discarded: 0 };
+      const leaseStatus = data && data.leaseStatus;
+      const saveBar = h(SaveStatus, {
+        lease: leaseStatus, deferred: deferredCounts, checkpointAt: data && data.checkpoint && data.checkpoint.createdAt,
+        busy: Boolean(busy && busy !== 'snapshot' && busy !== 'search'), draftKept,
+        onRetry: retrySave, onDiscard: () => { const queued = deferredItems.find(item => item.status === 'queued'); if (queued) discardDraft(queued.id); }, onReload: () => load(false),
+      });
       const tabs = [['overview', TEXT.overview], ['tasks', TEXT.tasks], ['contracts', TEXT.contracts], ['history', TEXT.history]];
       const overview = h(React.Fragment, null,
         h('div', { className: 'pm-metrics' }, metrics.map(([label, value]) => h('div', { className: 'pm-metric', key: label }, h('div', { className: 'pm-metric-label' }, label), h('div', { className: 'pm-metric-value pm-code' }, String(value))))),
@@ -184,9 +298,30 @@ window.__ModuleLoader__.load({
         section('下一步', h('p', { className: 'pm-copy' }, first(task.next_action || task.nextAction, first(data && (data.next_action || data.nextAction), '尚未记录下一步')))),
         section('Pending 操作', rows(asArray(data && (data.pending_operations || data.pendingOperations)), (item, i) => h('li', { className: 'pm-row', key: i }, h('div', null, h('div', { className: 'pm-row-title' }, typeof item === 'string' ? item : first(item.name, `操作 ${i + 1}`)), h('div', { className: 'pm-row-detail' }, typeof item === 'string' ? '' : json(item))), h('span', { className: 'pm-badge pm-badge-warn' }, 'Pending'))))
       );
+      const openTasks = asArray(data && data.tasks).filter(item => !['completed', 'archived'].includes(item.state));
+      const selectionBanner = data && data.selectionRequired ? h('div', { className: 'pm-status pm-status-conflict', role: 'alert' },
+        h('strong', null, '请选择一个任务'), h('div', null, '当前会话尚未绑定任务；请从下面的列表选择，不要按顺序猜测。'),
+        rows(asArray(data && data.taskCandidates), item => h('li', { className: 'pm-row', key: item.id },
+          h('div', null, h('div', { className: 'pm-row-title' }, first(item.title, item.id)), h('div', { className: 'pm-row-detail' }, `${item.id} · ${item.state}`)),
+          button('选择此任务', () => doUseTask(item.id), false, Boolean(busy) || !sessionId),
+        ))) : null;
+      const taskRow = item => h('li', { className: 'pm-row', key: item.id },
+        h('div', null, h('div', { className: 'pm-row-title' }, first(item.title, item.id)), h('div', { className: 'pm-row-detail' }, `${item.id} · ${item.state}${item.id === taskId ? ' · 当前会话已绑定' : ''}`)),
+        h('span', { className: 'pm-inline' },
+          item.id === taskId ? null : button('选择', () => doUseTask(item.id), false, Boolean(busy) || !sessionId),
+          item.state === 'paused' ? button('继续', () => doSetTaskState(item.id, 'active', '继续'), false, Boolean(busy)) : item.state === 'active' ? button('暂停', () => doSetTaskState(item.id, 'paused', '暂停'), false, Boolean(busy)) : null,
+          button('完成', () => doSetTaskState(item.id, 'completed', '标记完成'), false, Boolean(busy)),
+          button('归档', () => doSetTaskState(item.id, 'archived', '归档'), false, Boolean(busy)),
+        ));
       const taskView = h(React.Fragment, null,
-        section('当前任务', h('div', { className: 'pm-grid' }, field('任务 ID', input(String(taskId || ''), value => setBootstrap(v => ({ ...v, taskId: value })), { disabled: true })), field('状态', input(String(first(task.state, '—')), () => {}, { disabled: true })), field('Revision', input(String(taskRevision), () => {}, { disabled: true })), field('Lease token', input(String(first(leaseToken, '—')), () => {}, { disabled: true })), field('目标', textarea(String(first(task.objective, '')), () => {}, { disabled: true }), 'pm-span')), button(busy === 'claim' ? '领取中…' : TEXT.claim, doClaim, true, Boolean(busy || !taskId))),
-        section(TEXT.checkpoint, h('div', { className: 'pm-grid' }, field('阶段摘要', textarea(checkpoint.summary, value => setCheckpoint(v => ({ ...v, summary: value }))), 'pm-span'), field('下一步', textarea(checkpoint.nextAction, value => setCheckpoint(v => ({ ...v, nextAction: value }))), 'pm-span'), field('证据 JSON 数组', textarea(checkpoint.evidence, value => setCheckpoint(v => ({ ...v, evidence: value })), { placeholder: '[{"command":"npm test","result":"15 passed"}]' })), field('Pending 操作（每行一项）', textarea(checkpoint.pending, value => setCheckpoint(v => ({ ...v, pending: value }))))), button(busy === 'checkpoint' ? '保存中…' : TEXT.checkpoint, doCheckpoint, true, Boolean(busy || !taskId || !leaseToken)))
+        selectionBanner,
+        section('未完成任务', rows(openTasks, taskRow, '没有未完成任务；可在下方新建')),
+        section('新建任务', h('div', { className: 'pm-grid' }, field('目标', input(newTask.objective, value => setNewTask(v => ({ ...v, objective: value }))), { placeholder: '描述要完成的结果' })), button(busy === 'startTask' ? '创建中…' : '新建并绑定到当前会话', doStartTask, true, Boolean(busy || !sessionId || !newTask.objective.trim()))),
+        section('保存进度', h('div', { className: 'pm-grid' }, field('阶段摘要', textarea(commit.progress, value => setCommit(v => ({ ...v, progress: value }))), 'pm-span'), field('下一步', textarea(commit.nextAction, value => setCommit(v => ({ ...v, nextAction: value }))), 'pm-span'), field('阻塞项（每行一项）', textarea(commit.blockers, value => setCommit(v => ({ ...v, blockers: value }))), 'pm-span'), field('证据引用（每行一项）', textarea(commit.evidence, value => setCommit(v => ({ ...v, evidence: value })), { placeholder: 'test:unit' }), 'pm-span')), button(busy === 'commit' ? '保存中…' : '保存进度', doCommit, true, Boolean(busy || !taskId || !sessionId))),
+        section('待同步草稿', rows(deferredItems.filter(item => item.status === 'queued' || item.status === 'conflict'), item => h('li', { className: 'pm-row', key: item.id },
+          h('div', null, h('div', { className: 'pm-row-title' }, first(item.summary, '（无摘要）')), h('div', { className: 'pm-row-detail' }, `${item.sessionId} · 排队于 ${formatRelative(item.createdAt)}${item.reason ? ` · ${item.reason}` : ''}`)),
+          h('span', { className: 'pm-inline' }, item.status === 'conflict' ? h('span', { className: 'pm-badge pm-badge-warn' }, '需要复核') : h('span', { className: 'pm-badge' }, '排队中'), item.status === 'queued' ? button(TEXT.discardDraft, () => discardDraft(item.id), false, Boolean(busy)) : null),
+        ), '没有排队或需要复核的草稿'))
       );
       const contractView = h(React.Fragment, null,
         section(`已确认契约 v${contractRevision}`, h('pre', { className: 'pm-pre' }, json(contract.data || contract.value || contract))),
@@ -224,9 +359,9 @@ window.__ModuleLoader__.load({
 
       return h('main', { className: 'pm-root' }, h('style', null, CSS), h('div', { className: 'pm-shell' },
         h('header', { className: 'pm-header' }, h('div', null, h('h1', { className: 'pm-title' }, TEXT.title), h('p', { className: 'pm-subtitle' }, initialized ? `本地 SQLite · ${first(data && (data.branch || data.git_branch), '当前分支')}` : TEXT.uninitialized)), h('div', { className: 'pm-actions' }, button(busy === 'snapshot' ? TEXT.refreshing : TEXT.refresh, () => load(false), false, Boolean(busy)))),
-        h('div', { className: 'pm-workspace' }, input(cwd, setCwd, { 'aria-label': TEXT.cwd, placeholder: '输入项目根目录' }), button('载入目录', () => load(false), false, Boolean(busy || !cwd.trim()))),
+        h('div', { className: 'pm-workspace' }, h('span', { className: 'pm-workspace-label' }, TEXT.cwd), h('code', { className: 'pm-workspace-path' }, cwd || '等待当前会话的工作区…')),
         h(Feedback, { value: feedback, onReload: () => load(false) }),
-        initialized ? h(React.Fragment, null, h('nav', { className: 'pm-tabs', 'aria-label': '项目记忆视图' }, tabs.map(([id, label]) => h('button', { type: 'button', role: 'tab', className: 'pm-tab', 'aria-selected': tab === id, key: id, onClick: () => setTab(id) }, label))), tab === 'overview' ? overview : tab === 'tasks' ? taskView : tab === 'contracts' ? contractView : historyView) : bootstrapView
+        initialized ? h(React.Fragment, null, saveBar, h('nav', { className: 'pm-tabs', 'aria-label': '项目记忆视图' }, tabs.map(([id, label]) => h('button', { type: 'button', role: 'tab', className: 'pm-tab', 'aria-selected': tab === id, key: id, onClick: () => setTab(id) }, label))), tab === 'overview' ? overview : tab === 'tasks' ? taskView : tab === 'contracts' ? contractView : historyView) : bootstrapView
       ));
     }
 

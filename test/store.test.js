@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   ProjectMemoryStore,
   openProjectStore,
+  SCHEMA_VERSION,
 } from '../src/store.js';
 
 function temporaryProject(t) {
@@ -27,7 +28,7 @@ test('openProjectStore persists marker identity and enables WAL', (t) => {
   assert.equal(first.project.rootPath, path.resolve(root));
   const marker = JSON.parse(readFileSync(first.markerPath, 'utf8'));
   assert.equal(marker.project_id, firstId);
-  assert.equal(marker.schema_version, 2);
+  assert.equal(marker.schema_version, SCHEMA_VERSION);
   assert.equal('projectId' in marker, false);
   assert.equal(path.basename(first.databasePath), 'memory.sqlite');
   first.close();
@@ -415,7 +416,7 @@ test('checkpoint and recovery package preserve replay order and scope', (t) => {
     branch: 'main',
     workspace: 'workspace-a',
   });
-  assert.equal(recovery.schemaVersion, 2);
+  assert.equal(recovery.schemaVersion, SCHEMA_VERSION);
   assert.equal(recovery.project.eventSeq, 3);
   assert.equal(recovery.tasks.length, 1);
   assert.deepEqual(recovery.events.map((event) => event.seq), [1, 2, 3]);

@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
-import { openProjectStore } from '../src/store.js';
+import { openProjectStore, SCHEMA_VERSION } from '../src/store.js';
 import {
   commit, decideContractChange, proposeContractChange, readProjectSnapshot,
   startTask, useTask,
@@ -43,7 +43,7 @@ test('v1 migration preserves records, creates a recovery backup, and imports can
   t.after(() => store.close());
   assert.equal(store.getTask('legacy-project', 'legacy-task').contract.objective, 'Preserve me');
   assert.equal(store.listContractCandidates({ projectId: 'legacy-project' }).length, 1);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(state, 'project.json'))).schema_version, 2);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(state, 'project.json'))).schema_version, SCHEMA_VERSION);
   assert.equal(fs.existsSync(`${databasePath}.v1-backup`), true);
   store.close();
 });
@@ -61,11 +61,11 @@ test('session bindings prevent first-active selection and persist explicit choic
   assert.equal(readProjectSnapshot({ cwd: root, sessionId: 'session-c' }).task.id, second.task.id);
 });
 
-test('commit is host-managed and recovery remains complete, deterministic, and bounded', (t) => {
+test('commit is host-managed and recovery remains complete, deterministic, and bounded', async (t) => {
   const root = temporaryDirectory(t, 'dsh-memory-recovery-v3-');
   const nested = path.join(root, 'nested'); fs.mkdirSync(nested);
   const started = startTask({ cwd: root, sessionId: 'session-a', objective: 'x'.repeat(9000), constraints: ['constraint'.repeat(1000)], nextAction: 'verify recovery', idempotencyKey: 'start' });
-  const saved = commit({ cwd: nested, sessionId: 'session-a', progress: 'implemented', nextAction: 'verify recovery', evidenceRefs: ['test:unit'], idempotencyKey: 'commit' });
+  const saved = await commit({ cwd: nested, sessionId: 'session-a', progress: 'implemented', nextAction: 'verify recovery', evidenceRefs: ['test:unit'], idempotencyKey: 'commit' });
   assert.equal(saved.ok, true);
   const rootSnapshot = readProjectSnapshot({ cwd: root, sessionId: 'session-a' });
   const nestedSnapshot = readProjectSnapshot({ cwd: nested, sessionId: 'session-a' });
