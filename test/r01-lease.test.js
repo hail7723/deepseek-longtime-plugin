@@ -201,7 +201,7 @@ test('v2 databases upgrade to the deferred_commits schema with a backup', (t) =>
   store.enqueueDeferredCommit({ projectId: 'v2-project', taskId: 'v2-task', sessionId: 's', baseTaskVersion: 1, baseContractVersion: 1, kind: 'append', payload: {} });
   store.close();
   const marker = JSON.parse(fs.readFileSync(path.join(state, 'project.json'), 'utf8'));
-  assert.equal(marker.schema_version, 4);
+  assert.equal(marker.schema_version, 5);
 });
 
 function openRow(root, sql) {

@@ -5,7 +5,7 @@
 
 Local project memory for DeepSeek Harness: task and contract state lives in a project-local SQLite database, and a bounded deterministic recovery package is injected into every model request attempt.
 
-> **Development status.** `0.3.0-dev.1` is a local development build, not a release artifact. It has offline coverage for migration, bindings, recovery rendering, and Host/Client Gateway behavior. It has not been installed into a Desktop profile or used for a paid model request.
+> **Development status.** `0.3.0-dev.9` is a local development build. It has offline coverage for migration, bindings, participants, explicit completion, recovery rendering, Host/Client Gateway behavior, and real Harness compaction with captured fake-Provider requests. This build has not been installed into a Desktop profile or used for a paid model request.
 
 > **Package identity.** From `0.2.2` (and `0.1.2` for the host-only line) this project is published as `dsh-longtime-memory`, repository `hail7723/deepseek-longtime-plugin`. Earlier releases used `@hail7723/dsh-project-memory` in an older repository; that identity is superseded.
 
@@ -18,8 +18,10 @@ Host side:
 - project-monotonic event sequences, evidence, checkpoints, idempotency keys, leases, and fencing tokens;
 - independent task and contract revisions with compare-and-swap conflict errors;
 - persistent session-to-task bindings; one unfinished task may be selected automatically, while multiple tasks always require explicit selection;
+- independent session participants with persistent progress, per-participant CAS, derived stale presence, and bounded recovery;
+- `memory_update_progress`, `memory_participants`, and `memory_complete_task` distinguish personal progress from shared task lifecycle;
 - agent-scoped `memory_start_task`, `memory_use_task`, `memory_commit`, `memory_search`, and `memory_propose_contract_change` tools; revisions, leases, and fences remain Host internals;
-- schema-v1/v2/v3 to schema-v4 migration with a consistent same-directory recovery backup before upgrades;
+- schema-v1/v2/v3/v4 to schema-v5 migration with a consistent same-directory recovery backup before upgrades;
 - contract-candidate acceptance/rejection lifecycle and a correlated pending/succeeded/failed/unknown tool-operation record;
 - required runtime-context recovery on new sessions, resumed sessions, normal compaction, and overflow retries;
 - branch/workspace evidence isolation and pending tool-operation records.
@@ -36,6 +38,12 @@ Visual side (`0.2.x` compatibility panel):
 The panel is local-only: the browser receives JSON through the package-private `projectMemory` Remote service and never opens SQLite directly.
 
 It does not connect to Mem0, a vector database, cloud storage, or another device.
+
+Participants are a persistent state view for progress, recovery, and audit; they are not a message queue. The plugin cannot wake another session or guarantee that another Agent reads an update immediately. Real-time collaboration still requires Agent Teams, Harness scheduling, or a file/message mechanism. See [P2 identity, lifecycle and tool contracts](docs/p2-participant-lifecycle.md).
+
+Task lifecycle is `active / paused / blocked / completed / archived`. Participant status is `working / waiting / blocked / done` and belongs to one session only. Participant `done`, `inactive`, `stale`, or `disposed` never completes a task. Prefer `memory_complete_task` for explicit completion: it writes a terminal checkpoint/event, releases the caller's lease, preserves participant history, and invalidates the old binding. Queued/conflict drafts and a foreign live lease block completion; there is no force option. The compatibility `memory_commit.state` still means task lifecycle.
+
+P2.1's recovery contract is: **the first model request after completed compaction sees the latest recovery package**. A retained snapshot stays visible without another append; a covered snapshot is re-appended on the next request even when its text is unchanged. SQLite changes are read at request admission, including automatic overflow retries. Eleven offline black-box tests use the real `0.2.1-rc.3` Agent loop, basic compaction, session projection, JSONL persistence and a fake Provider. They confirm the existing mechanism, so dev.9 changes no plugin runtime logic and adds no schema, nonce, epoch or compaction hook. See [P2.1 contract, evidence and limits](docs/p2-compaction-reinjection.md).
 
 ## Compatibility
 
@@ -100,11 +108,14 @@ Use Plugin Manager to enable or disable `project-memory`. Disabling unloads its 
 
 Schema v4 adds a rebuildable search index and origin metadata for new queued drafts. Before upgrading a v1/v2/v3 database, the plugin creates `memory.sqlite.v<V>-backup` next to it using `VACUUM INTO`, including committed WAL data in a self-contained snapshot. Existing backups are retained, with a UUID suffix for a fresh retry backup. To roll back, disable the plugin and close every Harness process using that project, preserve the current database/sidecars and marker, restore the snapshot generated for that upgrade, and restore the marker's original schema version. Older backups made by previous builds may require their matching WAL sidecars. Never replace files while SQLite is open.
 
+Schema v5 adds the participant table keyed by `(project_id, task_id, participant_id)`. A v4 upgrade first creates the same-directory `memory.sqlite.v4-backup`, then creates the table and advances schema metadata in one transaction. The marker advances only after success. Failed v4→v5 DDL rolls back to a readable v4 database. No historical event is rewritten and no historical participant is guessed from old task data. Downgrading dev.8 requires restoring the v4 snapshot and matching marker; dev.7 cannot open a v5 database directly.
+
 See [P1 retrieval contract and migration details](docs/p1-search-reliability.md) for scope rules, queued versus confirmed results, the 16 KB budget, and query examples. Historical `passed` results have `freshness: "unknown"`; search does not revalidate evidence.
 
 ## Verification
 
-- `npm test` covers real Harness Agent output and Client/Host Gateway integration, schema migrations/backups, persistent task bindings, P0 reliability, P1 retrieval, and bounded recovery rendering. All test databases use `os.tmpdir()`.
+- `npm test` covers real Harness Agent output and Client/Host Gateway integration, schema migrations/backups, persistent task bindings, P0 reliability, P1 retrieval, P2 participant ownership/completion, and bounded recovery rendering. All test databases use `os.tmpdir()`.
+- P2.1 additionally captures actual offline Provider requests after full/partial compaction, SQLite updates, suppression, repeated compaction, overflow retry, summary failure/abort, startup/resume/fork, and recovery budget checks. The older repeated-provider-read identity test is explicitly not compaction evidence.
 - The previous isolated-browser evidence applies only to the v0.2 compatibility panel. Real Desktop new-session, `/compact`, and provider-overflow validation remain outstanding for v0.3.
 - Startup regressions from the withdrawn `0.2.0` and `0.2.1` builds are documented in `docs/desktop-boot-incident.md` and guarded by tests.
 

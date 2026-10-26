@@ -38,7 +38,7 @@ test('client mounts Remote descriptors before registering sidebar and main slots
       order.push('mount');
       assert.equal(contribution.package, 'dsh-longtime-memory');
       assert.deepEqual(contribution.descriptors.map(item => item.method), [
-        'workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract',
+        'workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract', 'participants', 'updateProgress', 'completeTask',
       ]);
       for (const descriptor of contribution.descriptors) {
         assert.equal(descriptor.service, 'projectMemory');

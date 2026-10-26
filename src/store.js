@@ -5,8 +5,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { mergeAcceptanceUpdates } from './acceptance.js';
 import { configureSearchFunctions, detectSearchCapabilities, installSearchIndex } from './search-index.js';
 import { searchPage } from './search.js';
+import { participantSchema, mapParticipant, participantView, validateProgress, validateNow } from './participants.js';
+import { publicJson } from './public-json.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const TASK_STATES = new Set(['active', 'paused', 'blocked', 'completed', 'archived']);
 const TRANSITIONS = Object.freeze({
   active: new Set(['paused', 'blocked', 'completed', 'archived']),
@@ -263,7 +265,7 @@ class ProjectMemoryStore {
 
     const markerSchemaVersion = marker.schema_version ?? marker.schemaVersion;
     const markerProjectId = marker.project_id ?? marker.projectId;
-    if (![1, 2, 3, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
+    if (![1, 2, 3, 4, SCHEMA_VERSION].includes(markerSchemaVersion) || typeof markerProjectId !== 'string') {
       throw new StoreError(`Invalid project marker at ${markerPath}`, 'INVALID_PROJECT_MARKER', { markerPath });
     }
     const databasePath = options.databasePath ?? path.join(stateDirectory, DEFAULT_DATABASE_FILE);
@@ -459,6 +461,12 @@ class ProjectMemoryStore {
         this.db.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
       });
     }
+    if (version < 5) {
+      this.#transaction(() => {
+        participantSchema(this.db);
+        this.db.prepare("UPDATE schema_meta SET value = '5' WHERE key = 'schema_version'").run();
+      });
+    }
   }
 
   close() {
@@ -543,6 +551,106 @@ class ProjectMemoryStore {
     requireString(sessionId, 'sessionId'); requireString(projectId, 'projectId'); requireString(workspaceId, 'workspaceId');
     return mapBinding(this.db.prepare(`SELECT * FROM session_bindings
       WHERE session_id = ? AND project_id = ? AND workspace_id = ?`).get(sessionId, projectId, workspaceId));
+  }
+
+  getParticipant({ projectId, taskId, participantId }) {
+    return mapParticipant(this.db.prepare('SELECT * FROM participants WHERE project_id=? AND task_id=? AND participant_id=?').get(projectId, taskId, participantId));
+  }
+
+  listParticipants({ projectId, taskId, branch, workspace, sessionId = '', now = Date.now(), limit = 50 }) {
+    validateNow(now);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new TypeError('participant limit must be 1–50');
+    return this.db.prepare(`SELECT * FROM participants WHERE project_id=? AND task_id=? AND branch=? AND workspace=?
+      ORDER BY CASE participant_id WHEN ? THEN 0 ELSE 1 END,last_seen_at DESC,participant_id COLLATE BINARY LIMIT ?`)
+      .all(projectId, taskId, branch, workspace, sessionId, limit).map(mapParticipant).map(row => participantView(row, now));
+  }
+
+  activateParticipant({ projectId, taskId, sessionId, branch, workspace, instanceId = null, source = 'unknown', parentSessionId, now = Date.now() }) {
+    return this.#transaction(() => {
+      const task = this.#requireTask(projectId, taskId);
+      if (['completed', 'archived'].includes(task.state)) return null;
+      const current = this.getParticipant({ projectId, taskId, participantId: sessionId });
+      const moved = current && (current.branch !== branch || current.workspace !== workspace);
+      return this.#writeParticipant({ projectId, taskId, sessionId, branch, workspace, expectedVersion: current?.version ?? 0,
+        patch: moved ? { status: 'waiting', summary: '', nextAction: null, blockers: [] } : {},
+        instanceId, source, parentSessionId, now, activate: true, lastCheckpointSeq: moved ? null : undefined });
+    });
+  }
+
+  updateParticipant(options) {
+    const { projectId, taskId, sessionId, participantId = sessionId, idempotencyKey } = options;
+    if (participantId !== sessionId) throw new StoreError('Only the current session may update its participant', 'PARTICIPANT_OWNER_CONFLICT');
+    const fingerprint = JSON.stringify(publicJson(options.patch ?? {}));
+    const key = idempotencyKey === undefined ? undefined : JSON.stringify(['progress', taskId, sessionId, options.branch, options.workspace, idempotencyKey]);
+    const result = this.#writeIdempotent(projectId, 'participant-progress', key, () => {
+      const task = this.#requireTask(projectId, taskId);
+      if (['completed', 'archived'].includes(task.state)) throw new StoreError('Task is terminal; choose another task to report progress', 'TASK_TERMINAL');
+      return { ...this.#writeParticipant(options), requestFingerprint: fingerprint };
+    });
+    if (result.requestFingerprint !== fingerprint) throw new IdempotencyError('Progress idempotency key was reused with different content');
+    return result;
+  }
+
+  #writeParticipant({ projectId, taskId, sessionId, participantId = sessionId, branch, workspace, expectedVersion,
+    patch = {}, now = Date.now(), lastCheckpointSeq, activate = false, instanceId, source, parentSessionId,
+    preservePresence = false, reportedAt, baseProgressSeq }) {
+    requireString(sessionId, 'sessionId'); requireString(branch, 'branch'); requireString(workspace, 'workspace');
+    if (participantId !== sessionId) throw new StoreError('Only the current session may update its participant', 'PARTICIPANT_OWNER_CONFLICT');
+    validateNow(now); validateProgress(patch);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0) throw new TypeError('expectedVersion must be a non-negative participant revision');
+    const current = this.getParticipant({ projectId, taskId, participantId });
+    if ((current?.version ?? 0) !== expectedVersion) throw new ConflictError('Participant version changed', 'PARTICIPANT_REVISION_CONFLICT', { expectedVersion, actualVersion: current?.version ?? 0 });
+    if (current && !activate && (current.branch !== branch || current.workspace !== workspace)) throw new StoreError('Participant scope changed; refresh this session before updating', 'PARTICIPANT_SCOPE_CONFLICT');
+    if (current && !activate && instanceId !== undefined && current.instanceId !== null && current.instanceId !== instanceId) throw new StoreError('This session instance has been replaced; refresh before updating', 'PARTICIPANT_INSTANCE_CONFLICT');
+    if (lastCheckpointSeq !== undefined && lastCheckpointSeq !== null && (!Number.isSafeInteger(lastCheckpointSeq) || lastCheckpointSeq < 1)) throw new TypeError('lastCheckpointSeq must be positive');
+    // A flush is a persisted old observation, not proof that its author is
+    // online. Never overwrite newer independently reported participant state.
+    if (preservePresence && current && (baseProgressSeq === undefined ? Boolean(current.summary)
+      : (current.lastProgressSeq ?? null) !== baseProgressSeq)) patch = {};
+    const value = { status: 'waiting', summary: '', nextAction: null, blockers: [], lastCheckpointSeq: null,
+      parentSessionId: null, instanceId: null, lastStartSource: 'unknown', ...current,
+      ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)) };
+    if (lastCheckpointSeq !== undefined) value.lastCheckpointSeq = lastCheckpointSeq;
+    if (instanceId !== undefined) value.instanceId = instanceId;
+    if (parentSessionId !== undefined) value.parentSessionId = parentSessionId;
+    if (source !== undefined) value.lastStartSource = source;
+    const version = expectedVersion + 1;
+    this.db.prepare(`INSERT INTO participants(project_id,task_id,participant_id,status,summary,next_action,blockers_json,branch,workspace,
+      version,last_seen_at,last_checkpoint_seq,active,disposed_at,inactive_reason,parent_session_id,last_start_source,instance_id)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(project_id,task_id,participant_id) DO UPDATE SET
+      status=excluded.status,summary=excluded.summary,next_action=excluded.next_action,blockers_json=excluded.blockers_json,
+      branch=excluded.branch,workspace=excluded.workspace,version=excluded.version,last_seen_at=excluded.last_seen_at,
+      last_checkpoint_seq=excluded.last_checkpoint_seq,active=excluded.active,disposed_at=excluded.disposed_at,inactive_reason=excluded.inactive_reason,
+      parent_session_id=excluded.parent_session_id,last_start_source=excluded.last_start_source,instance_id=excluded.instance_id`)
+      .run(projectId, taskId, participantId, value.status, value.summary, value.nextAction, encode(value.blockers), branch, workspace,
+        version, preservePresence ? current?.lastSeenAt ?? reportedAt ?? now : now, value.lastCheckpointSeq,
+        Number(preservePresence ? current?.active ?? false : true), preservePresence ? current?.disposedAt ?? null : null,
+        preservePresence ? current?.inactiveReason ?? 'deferred-observation' : null, value.parentSessionId, value.lastStartSource, value.instanceId);
+    const event = this.#appendEvent(projectId, taskId, activate ? 'participant.activated' : 'participant.progress',
+      { participantId, version, status: value.status, summary: value.summary, nextAction: value.nextAction, blockers: value.blockers, branch, workspace, observedAt: now }, { sessionId });
+    if (!activate && !preservePresence) this.db.prepare('UPDATE participants SET last_progress_seq=? WHERE project_id=? AND task_id=? AND participant_id=?').run(event.seq, projectId, taskId, participantId);
+    return { participant: this.getParticipant({ projectId, taskId, participantId }), event };
+  }
+
+  deactivateParticipants({ projectId, sessionId, workspace, instanceId, reason = 'disposed', releaseOwnLease = false, now = Date.now() }) {
+    validateNow(now);
+    return this.#transaction(() => {
+      const rows = this.db.prepare("SELECT * FROM participants WHERE project_id=? AND participant_id=? AND workspace=? AND (active=1 OR (disposed_at IS NULL AND ?='disposed'))").all(projectId, sessionId, workspace, reason);
+      for (const row of rows) {
+        if (instanceId !== undefined && row.instance_id !== instanceId) continue;
+        if (releaseOwnLease) {
+          const task = this.#requireTask(projectId, row.task_id);
+          if (task.leaseOwner === `project-memory:${sessionId}`) this.releaseLease({ projectId, taskId: row.task_id, owner: task.leaseOwner, fence: task.leaseFence });
+        }
+        this.#inactivateParticipant(row, reason, now);
+      }
+    });
+  }
+
+  #inactivateParticipant(row, reason, now) {
+    this.db.prepare('UPDATE participants SET active=0,disposed_at=?,inactive_reason=?,version=version+1 WHERE project_id=? AND task_id=? AND participant_id=?')
+      .run(reason === 'disposed' ? now : null, reason, row.project_id, row.task_id, row.participant_id);
+    this.#appendEvent(row.project_id, row.task_id, 'participant.inactive', { participantId: row.participant_id, reason, version: row.version + 1, observedAt: now }, { sessionId: row.participant_id });
   }
 
   bindSession({ sessionId, projectId, taskId, workspaceId, source = 'explicit' }) {
@@ -655,7 +763,8 @@ class ProjectMemoryStore {
     if (!Number.isSafeInteger(baseContractVersion) || baseContractVersion < 1) throw new TypeError('baseContractVersion must be positive');
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new TypeError('payload must be an object');
     return this.#transaction(() => {
-      this.#requireTask(projectId, taskId);
+      const task = this.#requireTask(projectId, taskId);
+      if (['completed', 'archived'].includes(task.state)) throw new StoreError('Task is terminal; select another task before queueing progress', 'TASK_TERMINAL');
       const timestamp = nowIso();
       this.db.prepare(`INSERT INTO deferred_commits(
           id, project_id, task_id, session_id, base_task_version, base_contract_version,
@@ -916,6 +1025,8 @@ class ProjectMemoryStore {
     branch,
     workspace,
     idempotencyKey,
+    participantUpdate,
+    now = Date.now(),
   }) {
     requireString(projectId, 'projectId');
     requireString(taskId, 'taskId');
@@ -940,6 +1051,9 @@ class ProjectMemoryStore {
 
     return this.#writeIdempotent(projectId, 'commit-checkpoint', idempotencyKey, () => {
       const current = this.#requireTask(projectId, taskId);
+      if (participantUpdate && ['completed', 'archived'].includes(current.state)) {
+        throw new StoreError('The task is terminal; select another task before reporting progress', 'TASK_TERMINAL');
+      }
       if (current.taskVersion !== expectedTaskVersion) {
         throw new ConflictError('Task version changed', 'TASK_REVISION_CONFLICT', {
           projectId,
@@ -958,7 +1072,7 @@ class ProjectMemoryStore {
           versionKind: 'contract',
         });
       }
-      this.#assertLease(current, lease);
+      this.#assertLease(current, lease, now);
 
       const next = { ...current, ...taskPatch };
       this.#assertTransition(current.state, next.state);
@@ -1058,6 +1172,11 @@ class ProjectMemoryStore {
       const checkpoint = mapCheckpoint(this.db.prepare('SELECT * FROM checkpoints WHERE id = ?').get(checkpointId));
       this.db.prepare('UPDATE tasks SET last_checkpoint_at = ?, last_activity_at = ?, updated_at = ? WHERE project_id = ? AND id = ?')
         .run(checkpoint.createdAt, checkpoint.createdAt, checkpoint.createdAt, projectId, taskId);
+      if (participantUpdate) {
+        const participant = this.getParticipant({ projectId, taskId, participantId: participantUpdate.sessionId });
+        this.#writeParticipant({ ...participantUpdate, projectId, taskId, branch, workspace,
+          expectedVersion: participantUpdate.expectedVersion ?? participant?.version ?? 0, now, lastCheckpointSeq: checkpoint.eventSeq });
+      }
       return {
         task: committedTask,
         evidence: storedEvidence,
@@ -1067,6 +1186,49 @@ class ProjectMemoryStore {
         coveredEventSeq,
       };
     });
+  }
+
+  completeTask({ projectId, taskId, sessionId = null, owner = `project-memory:${sessionId}`, branch, workspace,
+    summary, evidenceRefs = [], idempotencyKey, acceptanceUpdates, expectedVersion, now = Date.now(), instanceId }) {
+    requireString(summary, 'summary'); requireString(branch, 'branch'); requireString(workspace, 'workspace');
+    validateNow(now);
+    if (!Array.isArray(evidenceRefs) || !evidenceRefs.every(ref => typeof ref === 'string')) throw new TypeError('evidence_refs must be a string array');
+    const fingerprint = JSON.stringify(publicJson({ summary, evidenceRefs, acceptanceUpdates }));
+    const key = JSON.stringify(['complete', taskId, sessionId ?? owner, workspace, idempotencyKey ?? fingerprint]);
+    const result = this.#writeIdempotent(projectId, 'complete-task', key, () => {
+      const task = this.#requireTask(projectId, taskId);
+      if (['completed', 'archived'].includes(task.state)) throw new StoreError('Task is already terminal; select another task', 'TASK_TERMINAL');
+      if (expectedVersion !== undefined && task.taskVersion !== expectedVersion) this.#throwTaskConflict(projectId, taskId, expectedVersion, 'task');
+      const pending = this.db.prepare(`SELECT status,count(*) n FROM deferred_commits WHERE project_id=? AND task_id=? AND status IN ('queued','conflict') GROUP BY status`).all(projectId, taskId);
+      const queuedCount = Number(pending.find(row => row.status === 'queued')?.n ?? 0);
+      const conflictCount = Number(pending.find(row => row.status === 'conflict')?.n ?? 0);
+      if (queuedCount || conflictCount) throw new StoreError('Review, flush or discard queued/conflict drafts before completing this task', 'DEFERRED_COMPLETION_BLOCKED', { queuedCount, conflictCount });
+      const status = this.readLeaseStatus({ projectId, taskId, owner, now });
+      if (status.heldByOtherSession) throw new LeaseError('Another session holds the task lease; wait and retry completion', 'LEASE_CONFLICT',
+        { heldBy: 'other-session', retryAfterSeconds: status.retryAfterSeconds, canRetryAt: status.canRetryAt });
+      // A Remote caller may resolve the sole open task without a previous
+      // binding. Keep that selection inside the completion transaction so its
+      // terminal binding can identify idempotent retries too.
+      if (sessionId && !this.getSessionBinding({ projectId, sessionId, workspaceId: workspace })) {
+        this.bindSession({ projectId, taskId, sessionId, workspaceId: workspace, source: 'sole-open-task' });
+      }
+      const lease = this.acquireLease({ projectId, taskId, owner, ttlMs: 60000, now });
+      const data = acceptanceUpdates?.length ? { data: { ...task.data,
+        acceptanceUpdates: mergeAcceptanceUpdates(this.readAcceptanceUpdates({ projectId, taskId, branch, workspace }), acceptanceUpdates) } } : {};
+      const committed = this.commitCheckpoint({ projectId, taskId, expectedTaskVersion: task.taskVersion, expectedContractVersion: task.contractVersion,
+        lease, taskPatch: { state: 'completed', ...data }, branch, workspace, now,
+        evidence: evidenceRefs.map(ref => ({ kind: 'reference', payload: { ref } })),
+        checkpointPayload: { summary, evidenceRefs, terminal: true, taskState: 'completed', nextAction: null, blockers: [],
+          ...(sessionId ? { sessionId } : {}), ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }) },
+        ...(sessionId ? { participantUpdate: { sessionId, instanceId, patch: { status: 'done', summary, nextAction: null, blockers: [] } } } : {}),
+      });
+      for (const row of this.db.prepare('SELECT * FROM participants WHERE project_id=? AND task_id=? AND active=1').all(projectId, taskId)) this.#inactivateParticipant(row, 'task-completed', now);
+      this.#appendEvent(projectId, taskId, 'task.completed', { summary, checkpointId: committed.checkpoint.id, evidenceRefs, branch, workspace }, { sessionId });
+      this.releaseLease({ projectId, taskId, owner, fence: lease.fence });
+      return { ...committed, state: 'completed', synced: true, leaseReleased: true, flushed: 0, needsReview: 0, requestFingerprint: fingerprint };
+    });
+    if (result.requestFingerprint !== fingerprint) throw new IdempotencyError('Completion idempotency key was reused with different content');
+    return result;
   }
 
   createCheckpoint({
@@ -1224,9 +1386,9 @@ class ProjectMemoryStore {
     return task;
   }
 
-  #assertLease(task, lease) {
+  #assertLease(task, lease, now = Date.now()) {
     if (task.leaseOwner === null) return;
-    if (!lease || lease.owner !== task.leaseOwner || lease.fence !== task.leaseFence || task.leaseExpiresAt <= Date.now()) {
+    if (!lease || lease.owner !== task.leaseOwner || lease.fence !== task.leaseFence || task.leaseExpiresAt <= now) {
       throw new LeaseError('A current lease and fencing token are required', 'LEASE_CONFLICT', {
         projectId: task.projectId,
         taskId: task.id,
@@ -1299,6 +1461,12 @@ class ProjectMemoryStore {
   }
 
   #transaction(operation) {
+    if (this.db.isTransaction) {
+      const name = `memory_nested_${this.transactionCounter = (this.transactionCounter ?? 0) + 1}`;
+      this.db.exec(`SAVEPOINT ${name}`);
+      try { const result = operation(); this.db.exec(`RELEASE ${name}`); return result; }
+      catch (error) { this.db.exec(`ROLLBACK TO ${name}`); this.db.exec(`RELEASE ${name}`); throw error; }
+    }
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = operation();

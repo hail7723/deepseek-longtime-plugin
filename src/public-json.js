@@ -38,3 +38,15 @@ export function publicCommitResult(result) {
   return { ok, synced, projectId, taskId, taskVersion, contractVersion,
     checkpoint: { id, eventSeq, createdAt }, flushed, needsReview };
 }
+
+export function publicCompleteResult(result) {
+  if (!result.ok) return result;
+  const { projectId, taskId, state, taskVersion, contractVersion, leaseReleased } = result;
+  const { id, eventSeq, createdAt } = result.checkpoint;
+  const value = { ok: true, synced: true, projectId, taskId, state, taskVersion, contractVersion,
+    checkpoint: { id, eventSeq, createdAt }, leaseReleased };
+  if (Buffer.byteLength(JSON.stringify(value, null, 2)) > 2048) {
+    const error = new Error('Completion receipt exceeds its response budget'); error.code = 'PARTICIPANT_RESPONSE_TOO_LARGE'; throw error;
+  }
+  return value;
+}

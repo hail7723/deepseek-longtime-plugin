@@ -3,9 +3,10 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { openProjectStore } from './store.js';
-import { publicJson } from './public-json.js';
+import { publicJson, publicCompleteResult } from './public-json.js';
 import { validateAcceptanceUpdates, mergeAcceptanceUpdates } from './acceptance.js';
 import { parseSearchQuery } from './search.js';
+import { participantEnvelope, validateProgress, validateNow, clipUtf8 } from './participants.js';
 
 const MARKER_DIRECTORY = '.deepseek-memory';
 const MARKER_FILE = 'project.json';
@@ -113,6 +114,8 @@ function operationError(error) {
     'actualVersion',
     'versionKind',
     'markerPath',
+    'queuedCount',
+    'conflictCount',
   ]) {
     const value = error?.[key];
     if (value !== undefined && value !== null && ['string', 'number', 'boolean'].includes(typeof value)) {
@@ -232,7 +235,7 @@ function resolveTask(store, projectId, { taskId, sessionId, workspaceId }) {
   return { task: null, source: null, selectionRequired: candidates.length > 1, candidates };
 }
 
-function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT } = {}) {
+function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0, eventLimit = DEFAULT_EVENT_LIMIT, now = Date.now() } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
     if (!Number.isSafeInteger(sinceEventSeq) || sinceEventSeq < 0) {
@@ -248,6 +251,9 @@ function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0,
       const facts = workspaceFacts(projectRoot, currentDirectory);
       const resolution = resolveTask(store, projectId, { taskId, sessionId, workspaceId: facts.workspaceId });
       const task = resolution.task;
+      const binding = sessionId ? store.getSessionBinding({ sessionId, projectId, workspaceId: facts.workspaceId }) : null;
+      const lastBound = binding ? store.getTask(projectId, binding.taskId) : null;
+      const overview = task ? participantOverview(store, { projectId, taskId: task.id, sessionId, branch: facts.branch, workspace: facts.workspaceId, now }) : null;
       const tasks = store.listTasks(projectId);
       // The panel renders the save state from the viewer's perspective; the
       // agent flow passes its own session-derived owner.
@@ -263,6 +269,11 @@ function readProjectSnapshot({ cwd, taskId, sessionId, owner, sinceEventSeq = 0,
         project: store.getProject(projectId),
         tasks,
         task,
+        participants: overview?.participants ?? [],
+        participantCount: overview?.total ?? 0,
+        participantsTruncated: overview?.truncated ?? false,
+        currentParticipant: overview?.participants.find(row => row.participantId === sessionId) ?? null,
+        lastBoundTask: lastBound && ['completed', 'archived'].includes(lastBound.state) ? { id: lastBound.id, state: lastBound.state } : null,
         acceptanceUpdates: task === null ? null : store.readAcceptanceUpdates({ projectId, taskId: task.id, branch: facts.branch, workspace: facts.workspaceId }),
         selectionRequired: resolution.selectionRequired,
         taskCandidates: resolution.candidates ?? [],
@@ -337,7 +348,10 @@ function bootstrap({
           idempotencyKey,
         }).task;
       }
-      if (sessionId) store.bindSession({ sessionId, projectId, taskId: task.id, workspaceId: facts.workspaceId, source: 'explicit' });
+      if (sessionId) {
+        store.bindSession({ sessionId, projectId, taskId: task.id, workspaceId: facts.workspaceId, source: 'explicit' });
+        store.activateParticipant({ projectId, taskId: task.id, sessionId, branch: facts.branch, workspace: facts.workspaceId });
+      }
       return {
         ok: true,
         initialized: true,
@@ -361,6 +375,7 @@ function useTask({ cwd, sessionId, taskId } = {}) {
     return withStore(projectRoot, (store) => {
       const facts = workspaceFacts(projectRoot, currentDirectory); const projectId = store.project.id;
       const binding = store.bindSession({ sessionId, projectId, taskId, workspaceId: facts.workspaceId, source: 'explicit' });
+      store.activateParticipant({ projectId, taskId, sessionId, branch: facts.branch, workspace: facts.workspaceId });
       return { ok: true, projectId, task: store.getTask(projectId, taskId), binding, ...facts };
     });
   });
@@ -380,6 +395,8 @@ function setTaskState({ cwd, taskId, state, owner = 'project-memory-admin', expe
     return withStore(projectRoot, store => {
       const projectId = store.project.id; const task = selectTask(store, projectId, taskId);
       const revision = expectedRevision ?? task.taskVersion; requireNonNegativeInteger(revision, 'expectedRevision');
+      if (state === 'completed') return { ok: true, projectId, taskId,
+        ...store.completeTask({ projectId, taskId, owner, branch: task.branch ?? 'unknown', workspace: task.workspace ?? 'unknown', summary: 'Task completed explicitly', expectedVersion: revision }) };
       const lease = store.acquireLease({ projectId, taskId, owner, ttlMs: 300000 });
       const result = store.updateTask({ projectId, taskId, expectedVersion: revision, patch: { state }, lease, idempotencyKey: `state:${taskId}:${revision}:${state}` });
       if (['paused', 'completed', 'archived'].includes(state)) store.releaseLease({ projectId, taskId, owner, fence: lease.fence });
@@ -535,6 +552,9 @@ function replayDeferredItem(store, { projectId, taskId, item, owner, lease, fact
     branch: facts.branch,
     workspace: facts.workspaceId,
     idempotencyKey: `deferred:${item.id}`,
+    participantUpdate: { sessionId: item.sessionId, preservePresence: true, reportedAt: Date.parse(item.createdAt),
+      baseProgressSeq: item.payload.participantBaseSeq,
+      patch: { status: 'working', ...(item.payload.progress ? { summary: clipUtf8(item.payload.progress, 8192) } : {}) } },
   });
 }
 
@@ -548,6 +568,8 @@ function commit(options = {}) {
     const currentDirectory = resolvedCwd(cwd); requireString(sessionId, 'sessionId');
     if (!Array.isArray(blockers) || !Array.isArray(evidenceRefs)) throw new TypeError('commit lists must be arrays');
     validateAcceptanceUpdates(acceptanceUpdates);
+    if (state === 'completed') return completeTaskInternal({ cwd, sessionId, summary: String(progress || 'Task completed explicitly'), evidenceRefs,
+      idempotencyKey, acceptanceUpdates, instanceId: options.instanceId, now: options.now ?? Date.now() });
     const projectRoot = requireProjectRoot(currentDirectory);
     const owner = `project-memory:${sessionId}`;
     return withStoreAsync(projectRoot, async store => {
@@ -568,7 +590,7 @@ function commit(options = {}) {
       const attempt = () => {
         const lease = store.acquireLease({ projectId, taskId: task.id, owner, ttlMs: COMMIT_LEASE_TTL_MS });
         const latest = store.getTask(projectId, task.id);
-        const data = { ...latest.data, blockers, nextAction,
+        const data = { ...latest.data,
           ...(acceptanceUpdates?.length ? { acceptanceUpdates: mergeAcceptanceUpdates(
             store.readAcceptanceUpdates({ projectId, taskId: task.id, branch: facts.branch, workspace: facts.workspaceId }), acceptanceUpdates) } : {}),
         };
@@ -579,6 +601,10 @@ function commit(options = {}) {
           checkpointPayload: { summary: String(progress), nextAction, blockers,
             ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }), evidenceRefs, sessionId },
           branch: facts.branch, workspace: facts.workspaceId, idempotencyKey: idempotencyKey ?? `commit:${sessionId}:${latest.id}:${latest.taskVersion}`,
+          participantUpdate: { sessionId, instanceId: options.instanceId,
+            patch: { status: 'working', summary: options.progress === undefined ? undefined : clipUtf8(progress, 8192),
+              nextAction: options.nextAction === undefined ? undefined : options.nextAction === null ? null : clipUtf8(options.nextAction, 2048),
+              blockers: options.blockers?.slice(0, 16).map(item => clipUtf8(item, 512)) } },
         });
         return { result, lease };
       };
@@ -617,7 +643,8 @@ function commit(options = {}) {
           baseTaskVersion: task.taskVersion, baseContractVersion: task.contractVersion,
           kind: 'append',
           branch: facts.branch, workspace: facts.workspaceId,
-          payload: { progress: String(progress), ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }), evidenceRefs },
+          payload: { progress: String(progress), ...(acceptanceUpdates === undefined ? {} : { acceptanceUpdates }), evidenceRefs,
+            participantBaseSeq: store.getParticipant({ projectId, taskId: task.id, participantId: sessionId })?.lastProgressSeq ?? null },
         });
         return {
           ok: true, projectId, taskId: task.id, synced: false,
@@ -726,6 +753,100 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function selectedParticipantTask(store, projectId, sessionId, workspace, allowTerminal = false) {
+  const binding = store.getSessionBinding({ projectId, sessionId, workspaceId: workspace });
+  if (binding) {
+    const task = store.getTask(projectId, binding.taskId);
+    if (task && (allowTerminal || !['completed', 'archived'].includes(task.state))) return task;
+    throw Object.assign(new Error('The bound task is terminal; explicitly select another task'), { code: 'TASK_TERMINAL' });
+  }
+  const tasks = openTasks(store, projectId);
+  if (tasks.length !== 1) throw Object.assign(new Error('Choose a task before reporting participant progress'), { code: 'TASK_SELECTION_REQUIRED' });
+  return tasks[0];
+}
+
+function participantOverview(store, { projectId, taskId, sessionId, branch, workspace, now }) {
+  const rows = store.listParticipants({ projectId, taskId, sessionId, branch, workspace, now });
+  const total = Number(store.db.prepare('SELECT count(*) n FROM participants WHERE project_id=? AND task_id=? AND branch=? AND workspace=?').get(projectId, taskId, branch, workspace).n);
+  return participantEnvelope({ projectId, taskId, branch, workspace, rows, total, now });
+}
+
+function participants({ cwd, sessionId, now = Date.now() } = {}) {
+  return execute(() => {
+    requireString(sessionId, 'sessionId'); validateNow(now);
+    const current = resolvedCwd(cwd); const root = requireProjectRoot(current);
+    return withStore(root, store => {
+      const facts = workspaceFacts(root, current); const projectId = store.project.id;
+      const task = selectedParticipantTask(store, projectId, sessionId, facts.workspaceId, true);
+      return participantOverview(store, { projectId, taskId: task.id, sessionId, branch: facts.branch, workspace: facts.workspaceId, now });
+    });
+  });
+}
+
+function activateSession({ cwd, sessionId, instanceId, source = 'unknown', parentSessionId, now = Date.now() } = {}) {
+  return execute(() => {
+    const current = resolvedCwd(cwd); const root = findProjectRoot(current);
+    if (!root) return { ok: true, initialized: false };
+    return withStore(root, store => {
+      const facts = workspaceFacts(root, current); const projectId = store.project.id;
+      const resolution = resolveTask(store, projectId, { sessionId, workspaceId: facts.workspaceId });
+      if (!resolution.task) return { ok: true, taskId: null };
+      store.activateParticipant({ projectId, taskId: resolution.task.id, sessionId, instanceId, source, parentSessionId,
+        branch: facts.branch, workspace: facts.workspaceId, now });
+      return { ok: true, projectId, taskId: resolution.task.id };
+    });
+  });
+}
+
+function updateProgress({ cwd, sessionId, summary, status = 'working', nextAction, blockers, expectedVersion, idempotencyKey, instanceId, now = Date.now() } = {}) {
+  return execute(() => {
+    requireString(sessionId, 'sessionId'); validateNow(now);
+    if (idempotencyKey !== undefined) requireString(idempotencyKey, 'idempotencyKey');
+    const patch = publicJson({ summary, status, nextAction, blockers }); validateProgress(patch);
+    const current = resolvedCwd(cwd); const root = requireProjectRoot(current);
+    return withStore(root, store => {
+      const facts = workspaceFacts(root, current); const projectId = store.project.id;
+      const task = selectedParticipantTask(store, projectId, sessionId, facts.workspaceId);
+      assertReceiptIdentity({ projectId, taskId: task.id, participantId: sessionId });
+      const before = store.getParticipant({ projectId, taskId: task.id, participantId: sessionId });
+      const result = store.updateParticipant({ projectId, taskId: task.id, sessionId,
+        branch: facts.branch, workspace: facts.workspaceId, expectedVersion: expectedVersion ?? before?.version ?? 0,
+        patch, idempotencyKey, instanceId, now });
+      return { ok: true, projectId, taskId: task.id, participantId: sessionId, version: result.participant.version,
+        eventSeq: result.event.seq, lastSeenAt: new Date(result.participant.lastSeenAt).toISOString() };
+    });
+  });
+}
+
+function assertReceiptIdentity(identity) {
+  // Reserve over half the 2 KB receipt budget for fixed fields and revisions.
+  // Reject oversized legacy IDs before writing, rather than returning an error
+  // after a successful transaction whose receipt cannot be delivered.
+  if (Buffer.byteLength(JSON.stringify(identity, null, 2)) > 1024) {
+    throw Object.assign(new Error('Identity metadata exceeds the participant receipt budget'), { code: 'PARTICIPANT_RESPONSE_TOO_LARGE' });
+  }
+}
+
+function completeTaskInternal({ cwd, sessionId, summary, evidenceRefs = [], idempotencyKey, acceptanceUpdates, instanceId, now = Date.now() } = {}) {
+  requireString(sessionId, 'sessionId'); requireString(summary, 'summary'); validateNow(now);
+  if (idempotencyKey !== undefined) requireString(idempotencyKey, 'idempotencyKey');
+  if (Buffer.byteLength(summary) > 8192 || !Array.isArray(evidenceRefs) || evidenceRefs.length > 32
+    || !evidenceRefs.every(ref => typeof ref === 'string' && Buffer.byteLength(ref) <= 512)) throw new TypeError('completion requires a summary up to 8192 bytes and at most 32 string evidence_refs up to 512 bytes');
+  const current = resolvedCwd(cwd); const root = requireProjectRoot(current);
+  return withStore(root, store => {
+    const facts = workspaceFacts(root, current); const projectId = store.project.id;
+    const task = selectedParticipantTask(store, projectId, sessionId, facts.workspaceId, true);
+    assertReceiptIdentity({ projectId, taskId: task.id, participantId: sessionId });
+    const result = store.completeTask({ projectId, taskId: task.id, sessionId, summary, evidenceRefs, idempotencyKey,
+      acceptanceUpdates, branch: facts.branch, workspace: facts.workspaceId, instanceId, now });
+    return { ok: true, projectId, taskId: task.id, ...result };
+  });
+}
+
+function completeTask(options) {
+  return execute(() => publicCompleteResult(completeTaskInternal(options)));
+}
+
 function search({ cwd, sessionId, taskId, query, mode = 'any', scope = 'current', includeDeferred = true, limit = 20 } = {}) {
   return execute(() => {
     const currentDirectory = resolvedCwd(cwd);
@@ -812,6 +933,7 @@ function decideContractChange({ cwd, candidateId, decision, decidedBy = 'user', 
 }
 
 const operations = Object.freeze({
+  participants, updateProgress, completeTask, activateSession,
   readProjectSnapshot,
   bootstrap,
   claim,
@@ -830,6 +952,7 @@ const operations = Object.freeze({
 });
 
 export {
+  participants, updateProgress, completeTask, activateSession,
   operations,
   readProjectSnapshot,
   bootstrap,

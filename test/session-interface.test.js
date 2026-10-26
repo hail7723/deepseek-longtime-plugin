@@ -230,6 +230,23 @@ test('session-bound task flow crosses the gateway with explicit session ids', { 
   const stillA = await api.snapshot({ cwd: directory, session_id: 'panel-session-a' });
   assert.equal(stillA.value.task.id, first.value.task.id);
 
+  // P2: the Client descriptors and real Gateway expose all three contracts.
+  const progress = await api.updateProgress({ cwd: directory, session_id: 'panel-session-c', summary: 'peer independent progress', status: 'blocked' });
+  assert.equal(progress.value.ok, true, JSON.stringify(progress));
+  const overview = await api.participants({ cwd: directory, session_id: 'panel-session-c' });
+  assert.equal(overview.value.participants[0].participantId, 'panel-session-c');
+  assert.equal(overview.value.participants[0].status, 'blocked');
+  assert.ok(Buffer.byteLength(JSON.stringify(overview)) < 8192);
+  const blocked = await api.completeTask({ cwd: directory, session_id: 'panel-session-a', summary: 'not yet' });
+  assert.equal(blocked.value.error.code, 'DEFERRED_COMPLETION_BLOCKED');
+  const flush = await api.commit({ cwd: directory, session_id: 'panel-session-a', progress: 'flush before completion' });
+  assert.equal(flush.value.flushed, 1);
+  const terminal = await api.completeTask({ cwd: directory, session_id: 'panel-session-a', summary: 'wire complete', evidence_refs: ['gateway:test'], idempotency_key: 'wire-end' });
+  assert.equal(terminal.value.ok, true, JSON.stringify(terminal));
+  assert.equal(terminal.value.state, 'completed'); assert.equal(terminal.value.leaseReleased, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(terminal)) < 2048);
+  assert.equal((await api.snapshot({ cwd: directory, session_id: 'panel-session-a' })).value.task, null);
+
   // Missing session ids fail closed instead of guessing.
   const noSession = await api.commit({ cwd: directory, progress: 'no session' });
   assert.equal(noSession.ok, false);

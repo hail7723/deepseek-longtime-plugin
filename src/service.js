@@ -17,6 +17,9 @@ import {
   setTaskState as setTaskStateOperation,
   startTask as startTaskOperation,
   useTask as useTaskOperation,
+  participants as participantsOperation,
+  updateProgress as updateProgressOperation,
+  completeTask as completeTaskOperation,
 } from './operations.js';
 
 const remoteInitializers = [];
@@ -65,7 +68,8 @@ function presentSnapshot(snapshot, lease) {
       ...task,
       objective: task.contract?.objective ?? task.title,
       acceptanceCriteria: task.contract?.acceptanceCriteria ?? [],
-      nextAction: task.data?.nextAction ?? snapshot.checkpoint?.payload?.nextAction ?? null,
+      nextAction: snapshot.currentParticipant ? snapshot.currentParticipant.nextAction
+        : (snapshot.participantCount ?? 0) > 0 ? null : task.data?.nextAction ?? snapshot.checkpoint?.payload?.nextAction ?? null,
       ...(lease === undefined ? {} : { leaseToken: lease.fence }),
     },
     contract: task?.contract ?? null,
@@ -198,6 +202,24 @@ class ProjectMemoryRemoteService extends TypertRemoteService {
     });
   }
 
+  participants(request) {
+    request ??= {};
+    return participantsOperation({ cwd: normalizedCwd(request), sessionId: requireSessionId(request) });
+  }
+
+  updateProgress(request) {
+    request ??= {};
+    return updateProgressOperation({ cwd: normalizedCwd(request), sessionId: requireSessionId(request), summary: request.summary,
+      status: request.status, nextAction: request.next_action ?? request.nextAction, blockers: request.blockers,
+      expectedVersion: request.expected_version ?? request.expectedVersion, idempotencyKey: request.idempotency_key ?? request.idempotencyKey });
+  }
+
+  completeTask(request) {
+    request ??= {};
+    return completeTaskOperation({ cwd: normalizedCwd(request), sessionId: requireSessionId(request), summary: request.summary,
+      evidenceRefs: request.evidence_refs ?? request.evidenceRefs, idempotencyKey: request.idempotency_key ?? request.idempotencyKey });
+  }
+
   leaseStatus(request) {
     request ??= {};
     const cwd = normalizedCwd(request);
@@ -315,7 +337,7 @@ class ProjectMemoryRemoteService extends TypertRemoteService {
   }
 }
 
-for (const name of ['workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract']) {
+for (const name of ['workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract', 'participants', 'updateProgress', 'completeTask']) {
   Remote(name)(ProjectMemoryRemoteService.prototype[name], {
     kind: 'method',
     name,

@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 > The package was unified as `dsh-longtime-memory` in `0.1.2` and `0.2.2`. Entries before that use the historical package identity `@hail7723/dsh-project-memory`; they are kept for traceability.
 
+## [0.3.0-dev.9] - 2026-10-26
+
+### Added
+
+- Eleven offline black-box tests using public Harness APIs, real Agent requests, basic compaction, JSONL persistence and an in-process fake LLM adapter. They cover full/partial replacement, latest SQLite state, repeated compaction, required-context suppression, same-turn overflow retry, failure/abort, identities and byte budgets.
+- Exact `0.2.1-rc.3` development dependencies for the Agent loop, compaction, prompt/session/projection/token-meter services, LLM seam and JSONL resume/fork fixture.
+- P2.1 model-visible recovery contract and a separate Desktop validation gate in documentation and runtime evidence.
+
+### Clarified
+
+- Existing required agent-scoped recovery already satisfies reinjection: retained snapshots remain visible, covered snapshots are re-appended, and each request attempt reads current SQLite state. No plugin runtime code or schema changed; no nonce, epoch or unsupported hook was added.
+- Renamed the repeated provider-read P2 identity test to state explicitly that it is not real compaction evidence.
+
+### Not yet verified
+
+- Desktop `/compact`, automatic overflow compaction, and capture of the final post-compaction model request or equivalent surface. Offline evidence does not complete this gate.
+
+## [0.3.0-dev.8] - 2026-10-25
+
+### Added
+
+- Schema v5 participants, per-session progress/CAS, verified parent metadata, bounded participant overviews, derived stale presence, and guarded disposal.
+- `memory_update_progress`, `memory_participants`, and `memory_complete_task`, with real ToolRuntime and Client/Host Gateway coverage.
+- Consistent v4 migration backups and rollback tests; lifecycle source audit and explicit product boundaries in the P2 document.
+
+### Changed
+
+- Personal progress no longer overwrites peer state. Recovery prioritizes the current participant and labels peer presence and historical checkpoints.
+- Explicit task completion atomically records terminal state/checkpoint/event and releases its lease. Pending drafts and foreign live leases block completion; the existing binding becomes invalid and participant history remains.
+
+### Not yet verified
+
+- Real Desktop clear/fork/resume/compaction/shutdown behavior. No profile installation, publication or tag was performed.
+
 ## [0.3.0-dev.1] - 2026-10-24
 
 ### Added

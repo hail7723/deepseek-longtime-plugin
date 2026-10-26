@@ -1,6 +1,6 @@
 {
   "name": "dsh-longtime-memory",
-  "version": "0.3.0-dev.7",
+  "version": "0.3.0-dev.9",
   "description": "Local SQLite project memory for DeepSeek Harness with a native panel, durable recovery, and revision conflict checks.",
   "type": "module",
   "license": "MIT",
@@ -46,7 +46,16 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-agent-loop": "0.2.1-rc.3",
     "@deepseek-ai/dsh-api-gateway": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-compaction-basic": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-session-projection": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-token-meter": "0.2.1-rc.3",
     "@deepseek-ai/dsh-tools": "0.2.1-rc.3",
     "@deepseek-ai/dsh-typert-registry": "0.2.1-rc.3"
   },
@@ -55,8 +64,8 @@
     "dsh": ">=0.2.1-rc.3 <0.3.0"
   },
   "scripts": {
-    "check": "node --check index.js && node --check client.js && node --check src/plugin.js && node --check src/operations.js && node --check src/service.js && node --check src/store.js && node --check src/public-json.js && node --check src/acceptance.js && node --check src/search.js && node --check src/search-index.js",
-    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js test/operations.test.js test/service.test.js test/client.test.js test/gateway-runtime.test.js test/session-interface.test.js test/v03.test.js test/r01-lease.test.js test/r02-tasks.test.js test/p0-reliability.test.js test/p1-search.test.js",
+    "check": "node --check index.js && node --check client.js && node --check src/plugin.js && node --check src/operations.js && node --check src/service.js && node --check src/store.js && node --check src/public-json.js && node --check src/acceptance.js && node --check src/search.js && node --check src/search-index.js && node --check src/participants.js && node --check test/p2-compaction-reinjection.test.js",
+    "test": "node --test --test-isolation=none test/store.test.js test/plugin.test.js test/operations.test.js test/service.test.js test/client.test.js test/gateway-runtime.test.js test/session-interface.test.js test/v03.test.js test/r01-lease.test.js test/r02-tasks.test.js test/p0-reliability.test.js test/p1-search.test.js test/p2-participants.test.js test/p2-compaction-reinjection.test.js",
     "pack:check": "npm pack --dry-run"
   },
   "publishConfig": {

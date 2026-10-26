@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { openProjectStore } from './store.js';
 import { publicJson, publicCommitResult } from './public-json.js';
+import { clipUtf8 } from './participants.js';
 import {
   bootstrap as bootstrapOperation,
   checkpoint as checkpointOperation,
@@ -18,6 +19,10 @@ import {
   commit as commitOperation,
   listTasks as listTasksOperation,
   setTaskState as setTaskStateOperation,
+  participants as participantsOperation,
+  updateProgress as updateProgressOperation,
+  completeTask as completeTaskOperation,
+  activateSession,
 } from './operations.js';
 
 const MARKER_DIR = '.deepseek-memory';
@@ -33,7 +38,7 @@ function normalizeError(error) {
   return {
     ok: false,
     error: {
-      code: typeof error?.code === 'string' ? error.code : 'PROJECT_MEMORY_ERROR',
+      code: typeof error?.code === 'string' ? error.code : error instanceof TypeError ? 'INVALID_ARGUMENT' : 'PROJECT_MEMORY_ERROR',
       message: error?.code === 'LEASE_CONFLICT' ? 'Task lease is unavailable or the write token is stale' : error instanceof Error ? error.message : String(error),
       ...Number.isSafeInteger(error?.expectedVersion) ? { expectedVersion: error.expectedVersion } : {},
       ...Number.isSafeInteger(error?.actualVersion) ? { actualVersion: error.actualVersion } : {},
@@ -79,29 +84,42 @@ function renderRecoveryPackage(snapshot) {
     return [
       'PROJECT MEMORY — historical project state; current user instructions take precedence',
       recoveryLine('Project', snapshot.project.id),
+      ...(snapshot.lastBoundTask ? [recoveryLine('Previous task lifecycle', `${snapshot.lastBoundTask.id}: ${snapshot.lastBoundTask.state}`, 300)] : []),
       recoveryLine('Unfinished tasks', choices, 2200),
       'Use memory_use_task to choose one task. Never guess based on ordering.',
     ].join('\n');
   }
   const task = snapshot.task;
-  if (!task) return `PROJECT MEMORY — historical project state; current user instructions take precedence\nProject: ${snapshot.project.id}\nNo unfinished task is selected.`;
+  if (!task) return `PROJECT MEMORY — historical project state; current user instructions take precedence\n${recoveryLine('Project', snapshot.project.id, 300)}\nNo unfinished task is selected.${snapshot.lastBoundTask ? `\n${recoveryLine('Previous task lifecycle', `${snapshot.lastBoundTask.id}: ${snapshot.lastBoundTask.state}`, 300)}` : ''}`;
   const checkpoint = snapshot.checkpoint?.payload ?? {};
   const pending = (snapshot.toolOperations ?? []).filter(item => item.status === 'pending' || item.status === 'unknown');
+  const current = snapshot.currentParticipant;
+  const hasParticipants = (snapshot.participantCount ?? 0) > 0;
+  const peers = (snapshot.participants ?? []).filter(row => row.participantId !== current?.participantId).slice(0, 4);
   const parts = [
     'PROJECT MEMORY — historical project state; current user instructions take precedence',
-    recoveryLine('Project / Task', `${snapshot.project.id} / ${task.id} (${task.state})`),
-    recoveryLine('Revisions / workspace / branch / code', `${task.taskVersion}/${task.contractVersion}; ${snapshot.workspaceId}; ${snapshot.branch}; ${snapshot.codeRevision ?? 'unknown'}`),
-    recoveryLine('Objective', task.contract?.objective ?? task.title, 1000),
-    recoveryLine('Confirmed constraints', (task.contract?.constraints ?? []).join(' · ') || 'none', 850),
-    recoveryLine('Acceptance status', JSON.stringify(snapshot.acceptanceUpdates ?? task.data?.acceptanceUpdates ?? checkpoint.acceptanceUpdates ?? task.contract?.acceptanceCriteria ?? []), 850),
-    recoveryLine('Current state', checkpoint.summary ?? task.data?.progress ?? 'No confirmed checkpoint yet', 900),
-    recoveryLine('Pending or unknown external operations', pending.map(item => `${item.toolName} (${item.status})`).join(', ') || 'none', 500),
-    recoveryLine('Next action', checkpoint.nextAction ?? task.data?.nextAction ?? 'Review current work and commit evidence-backed progress.', 850),
-    recoveryLine('Last checkpoint / evidence references', `${snapshot.checkpoint?.id ?? 'none'} / ${(checkpoint.evidenceRefs ?? []).join(', ') || 'none'}`, 600),
-    'Conflict/write rule: use memory_commit; the Host rereads state and rejects conflicting objective, acceptance, status, or next-action changes. Use memory_search for history.',
+    recoveryLine('Project / Task', `${snapshot.project.id} / ${task.id} (${task.state})`, 300),
+    recoveryLine('Task lifecycle', task.state, 50),
+    ...(current ? [recoveryLine('Current participant', `${clipUtf8(current.participantId, 128)}; last reported status=${current.status}; presence=${current.presence}; last seen=${current.lastSeenAt}`, 350)] : []),
+    recoveryLine('Revisions / workspace / branch / code', `${task.taskVersion}/${task.contractVersion}; ${snapshot.workspaceId}; ${snapshot.branch}; ${snapshot.codeRevision ?? 'unknown'}`, 350),
+    recoveryLine('Objective', task.contract?.objective ?? task.title, 650),
+    recoveryLine('Confirmed constraints', (task.contract?.constraints ?? []).join(' · ') || 'none', 400),
+    recoveryLine('Acceptance status', JSON.stringify(snapshot.acceptanceUpdates ?? task.data?.acceptanceUpdates ?? checkpoint.acceptanceUpdates ?? task.contract?.acceptanceCriteria ?? []), 600),
+    recoveryLine('Current state', current ? current.summary || 'No progress recorded for this participant' : hasParticipants ? 'No progress recorded for this session' : checkpoint.summary ?? task.data?.progress ?? 'No confirmed checkpoint yet', 600),
+    recoveryLine('Pending or unknown external operations', pending.map(item => `${item.toolName} (${item.status})`).join(', ') || 'none', 250),
+    recoveryLine('Next action', current ? current.nextAction ?? 'Review your own progress.' : hasParticipants ? 'Choose your own next action.' : checkpoint.nextAction ?? task.data?.nextAction ?? 'Review current work and commit evidence-backed progress.', 400),
+    recoveryLine('Latest confirmed checkpoint (historical, not another session current state)', `${checkpoint.summary ?? 'none'}; historical next action=${checkpoint.nextAction ?? 'none'}`, 350),
+    recoveryLine('Last checkpoint / evidence references', `${snapshot.checkpoint?.id ?? 'none'} / ${(checkpoint.evidenceRefs ?? []).join(', ') || 'none'}`, 250),
   ];
-  while (Buffer.byteLength(parts.join('\n'), 'utf8') > MAX_RECOVERY_BYTES && parts.length > 10) parts.splice(6, 1);
-  return parts.join('\n');
+  const footer = 'Conflict/write rule: use memory_commit for shared confirmed evidence; memory_update_progress for your own progress; memory_complete_task for task completion. Use memory_search for history.';
+  const render = () => [...parts,
+    'Other participants — last reported progress; stale/inactive/disposed do not mean currently working:',
+    ...peers.map(row => recoveryLine(clipUtf8(row.participantId, 96), `status=${row.status}; presence=${row.presence}; ${row.summary || 'no summary'}`, 160)),
+    ...(snapshot.participantCount > peers.length + (current ? 1 : 0) ? ['Additional participant history omitted; use memory_participants for a bounded overview.'] : []), footer].join('\n');
+  // Remove complete peer rows in reverse priority. Field budgets keep self,
+  // lifecycle and guidance within the cap even when no peer rows remain.
+  while (Buffer.byteLength(render()) > MAX_RECOVERY_BYTES && peers.length) peers.pop();
+  return render();
 }
 
 function findProjectRoot(start) {
@@ -146,7 +164,8 @@ function workspaceFacts(projectRoot, cwd) {
   } catch {
     git = { branch: 'unknown', codeRevision: null };
   }
-  const canonical = path.resolve(cwd).toLowerCase();
+  let canonical;
+  try { canonical = fs.realpathSync.native(projectRoot).toLowerCase(); } catch { canonical = path.resolve(projectRoot).toLowerCase(); }
   const digest = createHash('sha256').update(canonical).digest('hex').slice(0, 20);
   return { workspaceId: `local:${digest}`, ...git };
 }
@@ -157,7 +176,7 @@ function validateString(value, name) {
 }
 
 class AgentMemoryBinding {
-  constructor(agent, cwd) {
+  constructor(agent, cwd, options = {}) {
     this.agent = agent;
     this.cwd = path.resolve(cwd);
     this.projectRoot = null;
@@ -165,14 +184,27 @@ class AgentMemoryBinding {
     this.projectId = null;
     this.taskId = null;
     this.lease = null;
+    this.leases = new Map();
+    this.instanceId = randomUUID();
+    this.clock = options.clock ?? Date.now;
+    this.source = options.source ?? 'unknown';
+    this.parentSessionId = agent.session?.header?.id === String(agent.id) && typeof agent.session.header.parentSession === 'string'
+      ? agent.session.header.parentSession : undefined;
     this.refresh(false);
+  }
+
+  activate() {
+    const result = activateSession({ cwd: this.cwd, sessionId: String(this.agent.id), instanceId: this.instanceId,
+      source: this.source, parentSessionId: this.parentSessionId, now: this.clock() });
+    if (!result.ok) throw Object.assign(new Error(result.error.message), { code: result.error.code });
+    if (result.taskId) this.taskId = result.taskId;
   }
 
   refresh(create) {
     const root = findProjectRoot(this.cwd) ?? (create ? this.cwd : null);
     if (root === null) return false;
     if (this.projectRoot === root && this.store !== null) return true;
-    this.close();
+    this.close('detached');
     this.projectRoot = root;
     this.store = openProjectStore(root);
     this.projectId = this.store.project.id;
@@ -197,6 +229,7 @@ class AgentMemoryBinding {
 
   bootstrap(args) {
     const sharedResult = bootstrapOperation({
+      sessionId: String(this.agent.id),
       cwd: this.cwd,
       taskId: args.task_id,
       objective: args.objective,
@@ -209,6 +242,7 @@ class AgentMemoryBinding {
     if (sharedResult.ok) {
       this.refresh(false);
       this.taskId = sharedResult.task.id;
+      this.activate();
     }
     return sharedResult;
 
@@ -251,18 +285,20 @@ class AgentMemoryBinding {
       sourceRef: args.source_ref ?? `session:${this.agent.id}`,
       idempotencyKey: args.idempotency_key,
     });
-    if (result.ok) { this.refresh(false); this.taskId = result.task.id; }
+    if (result.ok) { this.refresh(false); this.taskId = result.task.id; this.activate(); }
     return result;
   }
 
   useTask(args) {
     const result = useTaskOperation({ cwd: this.cwd, sessionId: String(this.agent.id), taskId: args.task_id });
-    if (result.ok) { this.refresh(false); this.taskId = result.task.id; }
+    if (result.ok) { this.refresh(false); this.taskId = result.task.id; this.activate(); }
     return result;
   }
 
   async commit(args) {
     const result = await commitOperation({
+      instanceId: this.instanceId,
+      now: this.clock(),
       cwd: this.cwd,
       sessionId: String(this.agent.id),
       progress: args.progress,
@@ -277,7 +313,8 @@ class AgentMemoryBinding {
       this.taskId = result.taskId;
       // Remember the lease we now hold so a normal dispose can release it;
       // a crashed process still falls back to the TTL.
-      if (result.synced && result.lease) this.lease = result.lease;
+      if (result.synced && result.lease) { this.lease = result.lease; this.leases.set(result.taskId, result.lease); }
+      if (args.state === 'completed') { this.lease = null; this.leases.delete(result.taskId); }
     }
     return result;
   }
@@ -288,6 +325,23 @@ class AgentMemoryBinding {
       taskId: args.task_id ?? this.taskId ?? undefined,
       sessionId: String(this.agent.id),
     });
+  }
+
+  updateProgress(args) {
+    return updateProgressOperation({ cwd: this.cwd, sessionId: String(this.agent.id), instanceId: this.instanceId,
+      summary: args.summary, status: args.status, nextAction: args.next_action, blockers: args.blockers,
+      expectedVersion: args.expected_version, idempotencyKey: args.idempotency_key, now: this.clock() });
+  }
+
+  participants() {
+    return participantsOperation({ cwd: this.cwd, sessionId: String(this.agent.id), now: this.clock() });
+  }
+
+  completeTask(args) {
+    const result = completeTaskOperation({ cwd: this.cwd, sessionId: String(this.agent.id), instanceId: this.instanceId,
+      summary: args.summary, evidenceRefs: args.evidence_refs, idempotencyKey: args.idempotency_key, now: this.clock() });
+    if (result.ok) { this.lease = null; this.leases.delete(result.taskId); }
+    return result;
   }
 
   deferredCommits(args) {
@@ -367,6 +421,7 @@ class AgentMemoryBinding {
     if (sharedResult.ok) {
       this.taskId = sharedResult.taskId;
       this.lease = sharedResult.leaseToken;
+      this.leases.set(sharedResult.taskId, sharedResult.leaseToken);
     }
     return sharedResult;
 
@@ -523,7 +578,7 @@ class AgentMemoryBinding {
   }
 
   recoveryText() {
-    return renderRecoveryPackage(readProjectSnapshot({ cwd: this.cwd, sessionId: String(this.agent.id) }));
+    return renderRecoveryPackage(readProjectSnapshot({ cwd: this.cwd, sessionId: String(this.agent.id), now: this.clock() }));
   }
 
   recordToolPending(exec) {
@@ -542,11 +597,19 @@ class AgentMemoryBinding {
     this.store.finishToolOperation({ callId: String(exec.callId), status: result?.isError ? 'failed' : 'succeeded', resultSummary: summary });
   }
 
-  close() {
-    if (this.store && this.taskId && this.projectId && this.lease) {
+  close(reason = 'disposed') {
+    if (this.store && this.projectId) {
       // Best-effort release on normal dispose; `agent/disposed` listeners are
       // not awaited by the Host, and a crash still relies on the lease TTL.
-      try { this.store.releaseLease({ projectId: this.projectId, taskId: this.taskId, owner: this.lease.owner, fence: this.lease.fence }); } catch { /* already moved on */ }
+      try { this.store.deactivateParticipants({ projectId: this.projectId, sessionId: String(this.agent.id), workspace: this.facts().workspaceId,
+        instanceId: this.instanceId, reason, releaseOwnLease: true, now: this.clock() }); } catch { /* best-effort disposal */ }
+      for (const [taskId, lease] of this.leases) {
+        try {
+          const participant = this.store.getParticipant({ projectId: this.projectId, taskId, participantId: String(this.agent.id) });
+          if (participant && participant.instanceId !== this.instanceId) continue;
+          this.store.releaseLease({ projectId: this.projectId, taskId, owner: lease.owner, fence: lease.fence });
+        } catch { /* already moved on */ }
+      }
     }
     if (this.store && this.taskId) {
       try { this.store.markPendingOperationsUnknown({ sessionId: String(this.agent.id), taskId: this.taskId }); } catch { /* shutdown must not throw */ }
@@ -556,10 +619,14 @@ class AgentMemoryBinding {
     this.projectId = null;
     this.projectRoot = null;
     this.lease = null;
+    this.leases.clear();
   }
 }
 
 const definitions = [
+  { name: 'memory_update_progress', method: 'updateProgress', description: 'Update only this session participant. working/waiting/blocked/done describe participant progress, never task lifecycle. Optional expected_version checks this participant CAS revision; use memory_complete_task for task completion.', parameters: objectSchema({ summary: { type: 'string' }, status: { type: 'string', enum: ['working', 'waiting', 'blocked', 'done'] }, next_action: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, expected_version: { type: 'integer', minimum: 0 }, idempotency_key: { type: 'string' } }) },
+  { name: 'memory_participants', method: 'participants', description: 'Read bounded participant progress for the selected task in this branch/workspace. Self is first. Stale, inactive and disposed reports are historical and do not mean another Agent is currently working. This does not send a message or wake another session.', parameters: objectSchema({}) },
+  { name: 'memory_complete_task', method: 'completeTask', description: 'Explicitly complete task lifecycle, record a terminal checkpoint and release this session lease. Queued/conflict drafts or another session live lease block completion; review/flush/discard drafts or wait and retry. Participant done/dispose does not complete a task. No force option.', parameters: objectSchema({ summary: { type: 'string', minLength: 1 }, evidence_refs: { type: 'array', items: { type: 'string' } }, idempotency_key: { type: 'string' } }, ['summary']) },
   { name: 'memory_start_task', method: 'startTask', description: 'Start a confirmed long-running task. The Host creates its id and binding.', parameters: objectSchema({ objective: { type: 'string' }, acceptance_criteria: { type: 'array', items: { type: 'string' } }, constraints: { type: 'array', items: { type: 'string' } }, next_action: { type: 'string' }, source_ref: { type: 'string' }, idempotency_key: { type: 'string' } }, ['objective']) },
   { name: 'memory_use_task', method: 'useTask', description: 'Explicitly select one task for this session.', parameters: objectSchema({ task_id: { type: 'string' } }, ['task_id']) },
   { name: 'memory_commit', method: 'commit', description: 'Save progress for the selected task. Strict fields (state, next_action, blockers) are rejected readably while another session holds the lease; independent appends (evidence, observations) defer into a durable queue that the next lease holder flushes.', parameters: objectSchema({ progress: { type: 'string' }, next_action: { type: 'string' }, blockers: { type: 'array', items: { type: 'string' } }, acceptance_updates: { type: 'array', items: { type: 'object', additionalProperties: true } }, evidence_refs: { type: 'array', items: { type: 'string' } }, state: { type: 'string' }, idempotency_key: { type: 'string' } }) },
@@ -583,7 +650,8 @@ const compatibilityDefinitions = [
 // Direct registration is retained for the v0.2 test harness; runtime `apply()`
 // passes an explicit config object, where compatibility tools are off by default.
 function registerAgent(agent, cwd, logger, options = { compatibilityTools: true }) {
-  const binding = new AgentMemoryBinding(agent, cwd);
+  const binding = new AgentMemoryBinding(agent, cwd, options);
+  binding.activate();
   const disposers = [];
   disposers.push(agent.ctx.systemPrompt.context({
     name: 'project-memory:recovery',
@@ -595,11 +663,19 @@ function registerAgent(agent, cwd, logger, options = { compatibilityTools: true 
   for (const definition of [...definitions, ...(options.adminTools ? adminDefinitions : []), ...(options.compatibilityTools ? compatibilityDefinitions : [])]) {
     disposers.push(agent.ctx.tools.register({
       name: definition.name,
-      description: definition.description,
+      description: definition.description + (definition.name === 'memory_commit' ? ' Its state field is task lifecycle, never participant status. Use memory_update_progress for independent session progress and prefer memory_complete_task to finish a task.' : ''),
       parameters: definition.parameters,
       output: outputDefinition(),
       async execute(args) {
         try {
+          // ToolRuntime.execute may be called directly without validating the
+          // advertised input schema. Enforce the new ownership-sensitive
+          // contracts here as well, including the absence of a force option.
+          if (['memory_update_progress', 'memory_participants', 'memory_complete_task'].includes(definition.name)) {
+            const value = args ?? {};
+            if (typeof value !== 'object' || Array.isArray(value)
+              || Object.keys(value).some(key => !Object.hasOwn(definition.parameters.properties, key))) throw new TypeError('Unknown or invalid participant tool arguments');
+          }
           const result = publicJson(await binding[definition.method](args ?? {}));
           return publicJson(definition.name === 'memory_commit' ? publicCommitResult(result) : result);
         } catch (error) {
@@ -607,7 +683,7 @@ function registerAgent(agent, cwd, logger, options = { compatibilityTools: true 
           return publicJson(normalizeError(error));
         }
       },
-      isConcurrencySafe: () => ['memory_search', 'memory_list_tasks', 'memory_lease_status', 'memory_deferred_list'].includes(definition.name),
+      isConcurrencySafe: () => ['memory_search', 'memory_list_tasks', 'memory_lease_status', 'memory_deferred_list', 'memory_participants'].includes(definition.name),
     }));
   }
   disposers.push(agent.ctx.on('tools/pre-execute', async (exec, next) => {
@@ -617,9 +693,9 @@ function registerAgent(agent, cwd, logger, options = { compatibilityTools: true 
   disposers.push(agent.ctx.on('tools/result', (exec, result) => {
     try { binding.recordToolResult(exec, result); } catch (error) { logger.warn(`tool result record failed: ${error.message}`); }
   }));
-  return async () => {
+  return async (reason = 'disposed') => {
     for (const dispose of disposers.reverse()) await dispose();
-    binding.close();
+    binding.close(reason);
   };
 }
 
@@ -629,12 +705,12 @@ export function apply(ctx) {
   const logger = ctx.logger;
   ctx.effect(() => {
     const agentDisposers = new Map();
-    ctx.on('agent/created', async ({ agent, signal }) => {
+    ctx.on('agent/created', async ({ agent, signal, source }) => {
       const cwd = await ctx.workingDirectory.ensure(agent, signal);
       // `config` is not a guaranteed injectable Host service in Harness
       // 0.2.1-rc.3.  Reading it here prevents session creation entirely.
       // Keep compatibility tools opt-in for direct/test registration only.
-      const dispose = registerAgent(agent, cwd, logger, {});
+      const dispose = registerAgent(agent, cwd, logger, { source });
       agentDisposers.set(agent, dispose);
     });
     ctx.on('agent/disposed', ({ agent }) => {
@@ -643,7 +719,7 @@ export function apply(ctx) {
       if (dispose) void dispose();
     });
     return async () => {
-      await Promise.allSettled([...agentDisposers.values()].map((dispose) => dispose()));
+      await Promise.allSettled([...agentDisposers.values()].map((dispose) => dispose('plugin-unloaded')));
       agentDisposers.clear();
     };
   });

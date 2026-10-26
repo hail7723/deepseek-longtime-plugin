@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
 
     const PROJECT_MEMORY_REMOTE = Object.freeze({
       package: 'dsh-longtime-memory',
-      descriptors: Object.freeze(['workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract'].map(method => Object.freeze({
+      descriptors: Object.freeze(['workspace', 'snapshot', 'startTask', 'useTask', 'listTasks', 'setTaskState', 'commit', 'bootstrap', 'claim', 'checkpoint', 'leaseStatus', 'deferred', 'discardDeferred', 'search', 'proposeContract', 'participants', 'updateProgress', 'completeTask'].map(method => Object.freeze({
         id: `dsh-longtime-memory#projectMemory/${method}`,
         service: 'projectMemory',
         namespace: 'projectMemory',

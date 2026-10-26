@@ -243,8 +243,8 @@ test('P1 migrates a genuine v3 fixture, backs up WAL state and leaves event cont
   let store;
   try {
     store = openProjectStore(root);
-    assert.equal(SCHEMA_VERSION, 4);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(state, 'project.json'))).schema_version, 4);
+    assert.equal(SCHEMA_VERSION, 5);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(state, 'project.json'))).schema_version, 5);
     assert.equal(fs.existsSync(`${databasePath}.v3-backup`), true);
     const backup = new DatabaseSync(`${databasePath}.v3-backup`, { readOnly: true });
     try {
@@ -382,7 +382,7 @@ test('P1 a failed v3 backfill rolls back schema/index changes and preserves its 
   const backupBytes = fs.readFileSync(`${databasePath}.v3-backup`);
   const recovered = openProjectStore(root);
   try {
-    assert.equal(recovered.db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '4');
+    assert.equal(recovered.db.prepare("SELECT value FROM schema_meta WHERE key='schema_version'").get().value, '5');
     assert.notEqual(recovered.migrationBackup, `${databasePath}.v3-backup`, 'retry must create a fresh snapshot without overwriting an older backup');
     assert.deepEqual(fs.readFileSync(`${databasePath}.v3-backup`), backupBytes);
   } finally { recovered.close(); }

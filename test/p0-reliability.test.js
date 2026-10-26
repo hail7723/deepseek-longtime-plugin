@@ -187,9 +187,9 @@ test('P0 memory_commit public result stays below 2 KB and omits internal objects
 test('P0 all registered Agent tools sanitize nested undefined and reject non-JSON output', async t => {
   const root = directory(t);
   const call = agent(t, root, 'a');
-  for (const method of ['startTask', 'useTask', 'commit', 'leaseStatus', 'deferredCommits', 'discardDeferredCommit', 'search', 'propose', 'listTasks', 'setTaskState', 'bootstrap', 'read', 'claim', 'checkpoint']) {
+  for (const method of ['startTask', 'useTask', 'commit', 'leaseStatus', 'deferredCommits', 'discardDeferredCommit', 'search', 'propose', 'listTasks', 'setTaskState', 'bootstrap', 'read', 'claim', 'checkpoint', 'updateProgress', 'participants', 'completeTask']) {
     const original = AgentMemoryBinding.prototype[method];
-    const names = { startTask: 'start_task', useTask: 'use_task', leaseStatus: 'lease_status', deferredCommits: 'deferred_list', discardDeferredCommit: 'deferred_discard', propose: 'propose_contract_change', listTasks: 'list_tasks', setTaskState: 'set_task_state' };
+    const names = { startTask: 'start_task', useTask: 'use_task', leaseStatus: 'lease_status', deferredCommits: 'deferred_list', discardDeferredCommit: 'deferred_discard', propose: 'propose_contract_change', listTasks: 'list_tasks', setTaskState: 'set_task_state', updateProgress: 'update_progress', completeTask: 'complete_task' };
     try {
       AgentMemoryBinding.prototype[method] = () => ({ ok: true, nested: { missing: undefined, list: [1, undefined, { absent: undefined }] } });
       assert.deepEqual(await call(`memory_${names[method] ?? method}`), { ok: true, nested: { list: [1, {}] } });
